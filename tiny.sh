@@ -1,6 +1,6 @@
 #! /bin/sh
 
-# Server/Client script for tinyfecVPN + udp2raw + shadowsocksr-libev + overture
+# Server/Client script for tinyfecVPN + udp2raw + shadowsocks + overture
 
 # System Required: Ubuntu 20
 
@@ -13,7 +13,7 @@
 # links
 tiny_vpn_repo=https://github.com/wangyu-/tinyfecVPN.git
 udp2raw_repo=https://github.com/wangyu-/udp2raw-tunnel.git
-ssr_repo=https://github.com/shadowsocksr-backup/shadowsocksr-libev.git
+ss_repo=https://github.com/shadowsocks/shadowsocks-libev.git
 overture_release=https://github.com/shawn1m/overture/releases/download/v1.6.1/overture-linux-amd64.zip
 
 red='\033[0;31m'
@@ -130,16 +130,20 @@ iptables -t mangle -A PREROUTING -p udp -j ssudp" >/root/iptables-config.sh
 [[ $EUID -ne 0 ]] && exception "This script must be run as root!"
 
 echo "------ Choose your platform"
-echp "(Server: 1), (Client: 2)" platform
-[[ -z "${platform}" ]] && [[ "${platform}" != "1" ]] && [[ "${platform}" != "2" ]] && exception "Must choose your platform!"
+read -p "[1: Sever, 2: Client]: " platform
+[[ -z "${platform}" ]] && exception "Must choose your platform!"
+
+if [[ "${platform}" != "1"  ]] &&  [[ "${platform}" != "2"  ]] ; then
+        exception "Platform must be ${yellow}1${plain}(Server) or ${yellow}2${plain}(Client)!"
+fi
 
 echo "------ Deleting existing repos"
 rm -rf /root/tinyvpn
 rm -rf /root/udp2raw
-rm -rf /root/ssr
+rm -rf /root/ss
 
 echo "------ Install dependencies"
-apt install git unzip build-essential cmake libsodium-dev libpcre3 libpcre3-dev libssl-dev zlib1g-dev -y
+apt install --no-install-recommends git gettext build-essential autoconf libtool libpcre3-dev asciidoc xmlto libev-dev libc-ares-dev automake libmbedtls-dev libsodium-dev -y
 
 if [[ "${platform}" == "2" ]]; then
     rm -rf /root/overture-linux-amd64.zip
@@ -151,22 +155,23 @@ fi
 echo "------ Downloading repos"
 git clone --recursive ${tiny_vpn_repo} /root/tinyvpn
 git clone ${udp2raw_repo} /root/udp2raw
-git clone ${ssr_repo} /root/ssr
+git clone ${ss_repo} /root/ss
 
 echo "------ Compiling repos"
 cd /root/tinyvpn
 ./makefile
 cd /root/udp2raw
 make
-cd /root/ssr
-export CFLAGS="${CFLAGS} -Wall -O3 -pipe -Wno-format-truncation -Wno-error=format-overflow -Wno-error=pointer-arith -Wno-error=stringop-truncation -Wno-error=sizeof-pointer-memacces>"
-./configure --prefix=/usr/local/shadowsocksR --disable-documentation
+cd /root/ss
+git submodule init && git submodule update
+./autogen.sh
+./configure --prefix=/usr/local/shadowsocks
 make
 make install
 
 if [[ "${platform}" == "2" ]]; then
     echo "------ Configuring the installation"
-    echo "Enter your server ip"
+    echo "Enter your Server IP"
     read -p ": " ip
     # ToDo: check if ip is valid
     [[ -z "${ip}" ]] && exception "Server IP must be set!"
@@ -176,9 +181,11 @@ echo "Enter tinyfecVPN sub net"
 read -p "Default(10.22.22.0): " subnet
 [[ -z "${subnet}" ]] && subnet="10.22.22.0"
 
-echo "Enter tinyfecVPN dev tunnel"
-read -p "Default(tun100): " tunnel
-[[ -z "${tunnel}" ]] && tunnel="tun100"
+if [[ "${platform}" == "2" ]]; then
+    echo "Enter tinyfecVPN dev tunnel"
+    read -p "Default(tun100): " tunnel
+    [[ -z "${tunnel}" ]] && tunnel="tun100"
+fi
 
 echo "Enter your udp2raw port"
 read -p "Default(443): " port
@@ -188,41 +195,34 @@ echo "Enter your fec setting"
 read -p "Default(20:10): " fec
 [[ -z "${fec}" ]] && fec="20:10"
 
-echo "Enter your upd2raw/tinyfecvpn password"
+echo "Enter your upd2raw/tinyfecVPN password"
 read -p "Default(1234): " password
 [[ -z "${password}" ]] && password="1234"
 
-echo "Enter your shadowsocks-r server port"
-read -p "Default(16541): " ssrport
-[[ -z "${ssrport}" ]] && ssrport="16541"
+echo "Enter your shadowsocks server port"
+read -p "Default(16541): " ssport
+[[ -z "${ssport}" ]] && ssport="16541"
 
-echo "Enter your shadowsocks-r password"
-read -p "Default(fakeshadow): " ssrpwd
-[[ -z "${ssrpwd}" ]] && ssrpwd="fakeshadow"
+echo "Enter your shadowsocks password"
+read -p "Default(fakeshadow): " sspwd
+[[ -z "${sspwd}" ]] && sspwd="fakeshadow"
 
-echo "------ Generating ssr config file"
+echo "------ Generating ss config file"
 if [[ "${platform}" == "1" ]]; then
     if check_kernel_version && check_kernel_headers; then
         fast_open="true"
     else
         fast_open="false"
     fi
-cat >/root/ssr-config.json <<-EOF
+cat >/root/ss-config.json <<-EOF
 {
     "server":"0.0.0.0",
-    "server_ipv6":"::",
-    "server_port":${ssrport},
+    "server_port":${ssport},
     "local_address":"127.0.0.1",
     "local_port":1080,
-    "password":"${ssrpwd}",
+    "password":"${sspwd}",
     "timeout":120,
-    "method":"none",
-    "protocol":"origin",
-    "protocol_param":"",
-    "obfs":"plain",
-    "obfs_param":"",
-    "redirect":"",
-    "dns_ipv6":false,
+    "method":"rc4-md5",
     "fast_open":${fast_open},
     "workers":1
 }
@@ -230,19 +230,16 @@ EOF
 fi
 
 if [[ "${platform}" == "2" ]]; then
-cat >/root/ssr-config.json <<-EOF
+cat >/root/ss-config.json <<-EOF
 {
-    "server": "${ssr_server}.1",
-    "server_port": ${ssrport},
+    "server": "${ss_server}.1",
+    "server_port": ${ssport},
+    "local_address": "0.0.0.0",
     "local_port": 1081,
-    "password": "${ssrpwd}",
+    "password": "${sspwd}",
     "timeout": 120,
-    "method": "none",
-    "protocol": "origin",
-    "obfs": "plain",
-    "obfsparam": "" ,
-    "group": "ssr",
-    "local_address": "0.0.0.0"
+    "method": "rc4-md5",
+    "workers": 1
 }
 EOF
 fi
@@ -254,15 +251,15 @@ service_template "/root/udp2raw.sh" "udp2raw"
 systemctl enable udp2raw.service
 
 if [[ "${platform}" == "1" ]]; then
-    service_template "/usr/local/shadowsocksR/bin/ss-redir -s /root/ssr-config.json -u" "ssr"
-    systemctl enable ssr.service
+    service_template "/usr/local/shadowsocks/bin/ss-server -s /root/ss-config.json -u" "ss"
+    systemctl enable ss.service
 fi
 
 if [[ "${platform}" == "2" ]]; then
     service_template "/root/overture/overture-linux-amd64 -c /root/overture/config.json" "overture"
     systemctl enable overture.service
-    service_template "/usr/local/shadowsocksR/bin/ss-redir -c /root/ssr-config.json -u" "ssr"
-    systemctl enable ssr.service
+    service_template "/usr/local/shadowsocks/bin/ss-redir -c /root/ss-config.json -u" "ss"
+    systemctl enable ss.service
     service_template "/root/iptables-config.sh" "iptables-config"
     systemctl enable iptables-config.service
 fi
@@ -270,14 +267,14 @@ fi
 echo "------ Generating start script and give them root privilege"
 if [[ "${platform}" == "1" ]]; then
     echo "#! /bin/sh
-    ./root/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:4096 -f $fec --sub-net $subnet --tun-dev $tunnel --keep-reconnect -k $password" >/root/tinyvpn.sh
+    ./root/tinyvpn/tinyvpn_amd64 -s -l0.0.0.0:14096 -f $fec --sub-net $subnet -k $password" >/root/tinyvpn.sh
     echo "#! /bin/sh
-    ./root/udp2raw/udp2raw -c -r$ip:$port -l 127.0.0.1:4096 --raw-mode faketcp -a -k $password" >/root/udp2raw.sh
+    ./root/udp2raw/udp2raw -s -l0.0.0.0:$port -r127.0.0.1:14096 --raw-mode faketcp -a -k $password" >/root/udp2raw.sh
 elif [[ "${platform}" == "2" ]]; then
     echo "#! /bin/sh
-    ./root/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:4096 -f $fec --sub-net $subnet --tun-dev $tunnel --keep-reconnect -k $password" >/root/tinyvpn.sh
+    ./root/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:14096 -f $fec --sub-net $subnet --tun-dev $tunnel --keep-reconnect -k $password" >/root/tinyvpn.sh
     echo "#! /bin/sh
-    ./root/udp2raw/udp2raw -c -r$ip:$port -l 127.0.0.1:4096 --raw-mode faketcp -a -k $password" >/root/udp2raw.sh
+    ./root/udp2raw/udp2raw -c -r$ip:$port -l 127.0.0.1:14096 --raw-mode faketcp -a -k $password" >/root/udp2raw.sh
 fi
 
 chmod +x /root/tinyvpn.sh
@@ -289,7 +286,7 @@ if [[ "${platform}" == "2" ]]; then
 fi
 
 echo "------ Cleaning up"
-systemctl start ssr.service
+systemctl start ss.service
 systemctl start tinyvpn.service
 systemctl start udp2raw.service
 
@@ -307,12 +304,11 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "${red}Copy the info below as you need them in your client script!${plain}"
     echo -e "Your Server IP                   : ${red} $(get_ip) ${plain}"
     echo -e "Your tinyfecVPN sub net          : ${red} ${subnet} ${plain}"
-    echo -e "Your tinyfecVPN dev tunnel       : ${red} ${tunnel} ${plain}"
     echo -e "Your tinyfecVPN fec setting      : ${red} ${fec} ${plain}"
     echo -e "Your udp2raw Port                : ${red} ${port} ${plain}"
-    echo -e "Your upd2raw/tinyfecVPN password : ${red} ${port} ${plain}"
-    echo -e "Your shadowsocks-r Port          : ${red} ${ssrport} ${plain}"
-    echo -e "Your shadowsocks-r Password      : ${red} ${ssrpwd} ${plain}"
+    echo -e "Your upd2raw/tinyfecVPN password : ${red} ${password} ${plain}"
+    echo -e "Your shadowsocks Port            : ${red} ${ssport} ${plain}"
+    echo -e "Your shadowsocks Password        : ${red} ${sspwd} ${plain}"
 elif [[ "${platform}" == "2" ]]; then
     echo -e "Congratulations, ${green}Client${plain} install completed!"
 fi
