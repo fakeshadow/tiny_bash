@@ -6,6 +6,6 @@
 #### 使用方法:
 
 - 使用root账户登录系统
-- `wget --no-check-certificate https://github.com/fakeshadow/tiny_bash/raw/master/tiny.sh`
+- `wget --no-check-certificate https://raw.githubusercontent.com/fakeshadow/tiny_bash/master/tiny.sh`
 - `chmod +x tiny.sh`
 - `./tiny.sh`
