@@ -17,7 +17,7 @@ tiny_vpn_repo="https://github.com/wangyu-/tinyfecVPN.git"
 udp2raw_repo="https://github.com/wangyu-/udp2raw-tunnel.git"
 ssr_server_url="https://github.com/shadowsocksrr/shadowsocksr/archive/3.2.2.tar.gz"
 ssr_client_url="https://github.com/shadowsocksr-backup/shadowsocksr-libev.git"
-overture_url="https://github.com/shawn1m/overture/releases/download/v1.6.1/overture-linux-amd64.zip"
+overture_url="https://github.com/shawn1m/overture/releases/download/v1.8/overture-linux-amd64.zip"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -353,7 +353,7 @@ if [[ "${platform}" == "1" ]]; then
 fi
 
 if [[ "${platform}" == "2" ]]; then
-    create_service "/usr/local/overture/overture-linux-amd64 -c /usr/local/overture/config.json" "overture"
+    create_service "/usr/local/overture/overture-linux-amd64 -c /usr/local/overture/config.yml" "overture"
     # start overture service early so we have correct dns when curl for chnroutes
     systemctl stop systemd-resolved
     systemctl disable systemd-resolved
