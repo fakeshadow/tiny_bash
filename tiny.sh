@@ -2,9 +2,10 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# Server/Client script for tinyfecVPN + udp2raw + shadowsocksR + overture
+# Server/Client script for tinyfecVPN + udp2raw (ICMP mode), with optional
+# xray-Reality on TCP/443 for mobile clients (server only).
 
-# System Required: Ubuntu 20
+# System Required: Ubuntu 24.04
 
 # Important:
 # This script is for learning bash operations. Please delete all the compiled files after you done with it.
@@ -15,9 +16,13 @@ export PATH
 # links
 tiny_vpn_repo="https://github.com/wangyu-/tinyfecVPN.git"
 udp2raw_repo="https://github.com/wangyu-/udp2raw-tunnel.git"
-ssr_server_url="https://github.com/shadowsocksrr/shadowsocksr/archive/3.2.2.tar.gz"
-ssr_client_url="https://github.com/shadowsocksr-backup/shadowsocksr-libev.git"
-overture_url="https://github.com/shawn1m/overture/releases/download/v1.8/overture-linux-amd64.zip"
+chnroutes_url="https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+xray_install_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+
+# udp2raw uses port numbers as internal multiplexing tags in icmp mode; not on the wire.
+udp2raw_port=4096
+# tinyvpn tun device name; same on both sides for nftables references.
+tun_dev="tun100"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -29,174 +34,265 @@ exception() {
 }
 
 get_ip(){
-    local IP=$( ip addr | egrep -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | egrep -v "^192\.168|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-2]\.|^10\.|^127\.|^255\.|^0\." | head -n 1 )
+    local IP=$( ip addr | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -Ev "^192\.168|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-2]\.|^10\.|^127\.|^255\.|^0\." | head -n 1 )
     [[ -z ${IP} ]] && IP=$( wget -qO- -t1 -T2 ipv4.icanhazip.com )
     [[ -z ${IP} ]] && IP=$( wget -qO- -t1 -T2 ipinfo.io/ip )
     echo ${IP}
 }
 
-version_ge(){
-    test "$(echo "$@" | tr " " "\n" | sort -rV | head -n 1)" == "$1"
+detect_wan_iface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1
 }
 
-version_gt(){
-    test "$(echo "$@" | tr " " "\n" | sort -V | head -n 1)" != "$1"
-}
-
-check_kernel_version(){
-    local kernel_version=$(uname -r | cut -d- -f1)
-    if version_gt ${kernel_version} 3.7.0; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-check_kernel_headers(){
-    if check_sys packageManager yum; then
-        if rpm -qa | grep -q headers-$(uname -r); then
-            return 0
-        else
-            return 1
-        fi
-    elif check_sys packageManager apt; then
-        if dpkg -s linux-headers-$(uname -r) > /dev/null 2>&1; then
-            return 0
-        else
-            return 1
-        fi
-    fi
-    return 1
-}
-
-download(){
-    local filename=$(basename $1)
-    if [[ -f ${1} ]]; then
-        echo "${filename} [found]"
-    else
-        echo "${filename} not found, download now..."
-        wget --no-check-certificate -c -t3 -T60 -O ${1} ${2}
-        if [[ $? -ne 0 ]]; then
-            echo -e "[${red}Error${plain}] Download ${filename} failed."
-            exit 1
-        fi
-    fi
-}
-
-enable_ipv4_forward() {
-cat <<'EOF' > /etc/sysctl.conf
+enable_ip_forward() {
+cat <<'EOF' > /etc/sysctl.d/99-vpn.conf
 net.ipv4.ip_forward=1
 EOF
-sysctl -p
+sysctl --system >/dev/null
+}
+
+enable_icmp_ignore() {
+cat <<'EOF' > /etc/sysctl.d/99-udp2raw-icmp.conf
+# udp2raw uses ICMP raw sockets in --raw-mode icmp. Stop the kernel from
+# auto-replying to pings, otherwise its replies fight with udp2raw's own.
+# Side effect: server can no longer be pinged from anywhere — use TCP-based
+# liveness checks instead.
+net.ipv4.icmp_echo_ignore_all=1
+EOF
+sysctl --system >/dev/null
+}
+
+configure_dns() {
+mkdir -p /etc/systemd/resolved.conf.d
+cat <<'EOF' > /etc/systemd/resolved.conf.d/dot.conf
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
+FallbackDNS=9.9.9.9#dns.quad9.net
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Cache=yes
+EOF
+systemctl restart systemd-resolved
 }
 
 create_service() {
-cat <<EOF > /etc/systemd/system/${2}.service
+local exec="$1"
+local name="$2"
+local deps="$3"  # optional space-separated unit list
+local after="network-online.target"
+local requires=""
+if [[ -n "$deps" ]]; then
+    after="${after} ${deps}"
+    requires="Requires=${deps}"
+fi
+cat <<EOF > /etc/systemd/system/${name}.service
 [Unit]
 Wants=network-online.target
-After=network-online.target
+After=${after}
+${requires}
 
 [Service]
-Type=idle
-ExecStart=$1
+ExecStart=${exec}
 Restart=always
 
 [Install]
-WantedBy=basic.target
+WantedBy=multi-user.target
 EOF
-systemctl enable ${2}.service
+systemctl enable ${name}.service
 }
 
-create_chnroutes() {
-mkdir /etc/chnroutes
-cat <<'EOF' > /etc/cron.weekly/chnroutes
+create_chnroutes_cron() {
+mkdir -p /etc/nftables.d
+# Placeholder so the include in /etc/nftables.conf parses on first boot.
+[[ -f /etc/nftables.d/chnroutes.nft ]] || echo "# populated by /etc/cron.weekly/chnroutes" > /etc/nftables.d/chnroutes.nft
+
+cat <<EOF > /etc/cron.weekly/chnroutes
 #!/usr/bin/env bash
+set -e
 
-FILEPATH=/root/temp2333
-FILENAME=chnroutes
-TARGETPATH=/etc/chnroutes/
+URL="${chnroutes_url}"
+OUTPUT="/etc/nftables.d/chnroutes.nft"
+TMP=\$(mktemp)
+trap 'rm -f "\$TMP"' EXIT
 
-rm -rf $FILEPATH
-mkdir $FILEPATH
-cd $FILEPATH
-curl -sL https://raw.githubusercontent.com/zealic/autorosvpn/master/chnroutes.txt | egrep -v '^$|^#' > $FILENAME
+curl -sL "\$URL" | grep -Ev '^\$|^#' > "\$TMP"
 
-FILESIZE=$(stat -c%s "$FILENAME")
-
-if [[ $FILESIZE > 10000 ]]; then
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-
-    ipset destroy chnroutes
-
-    ipset -N chnroutes hash:net
-    for i in `cat $FILENAME`; do echo ipset -A chnroutes $i >> ipset.sh; done
-    chmod +x ipset.sh && ./ipset.sh
-    ipset save chnroutes > chnroutes.ipset
-
-    rm -rf "${TARGETPATH}"chnroutes.ipset
-    mv chnroutes.ipset "${TARGETPATH}"chnroutes.ipset
-    rm -rf $FILEPATH
-    cd / && ./etc/iptables/iptables.sh
+if [[ ! -s "\$TMP" ]] || [[ \$(wc -l < "\$TMP") -lt 1000 ]]; then
+    echo "chnroutes download looks bad, aborting" >&2
+    exit 1
 fi
+
+{
+    echo "add element inet vpngw chnroutes {"
+    paste -sd, "\$TMP"
+    echo "}"
+} > "\$OUTPUT.new"
+
+mv "\$OUTPUT.new" "\$OUTPUT"
+nft -f /etc/nftables.conf
 EOF
 chmod +x /etc/cron.weekly/chnroutes
 }
 
-iptables_configure() {
-mkdir /etc/iptables
-cat <<EOF > /etc/iptables/iptables.sh
-#!/usr/bin/env bash
+nftables_configure_client() {
+local server_ip="$1"
+cat <<EOF > /etc/nftables.conf
+#!/usr/sbin/nft -f
 
-ip rule add fwmark 0x01/0x01 table 100
-ip route add local 0.0.0.0/0 dev lo table 100
+# Idempotent: declare-then-flush so re-runs replace cleanly without affecting
+# any other tables.
+add table inet vpngw
+flush table inet vpngw
 
-ipset destroy chnroutes
-ipset restore < /etc/chnroutes/chnroutes.ipset
+table inet vpngw {
+    set chnroutes {
+        type ipv4_addr
+        flags interval
+    }
 
-iptables -t nat -N sstcp
-iptables -t nat -A sstcp -d 0.0.0.0/8 -j RETURN
-iptables -t nat -A sstcp -d 10.0.0.0/8 -j RETURN
-iptables -t nat -A sstcp -d 127.0.0.0/8 -j RETURN
-iptables -t nat -A sstcp -d 169.254.0.0/16 -j RETURN
-iptables -t nat -A sstcp -d 172.16.0.0/12 -j RETURN
-iptables -t nat -A sstcp -d 192.168.0.0/16 -j RETURN
-iptables -t nat -A sstcp -d 224.0.0.0/4 -j RETURN
-iptables -t nat -A sstcp -d 240.0.0.0/4 -j RETURN
+    set bypass4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8,
+            10.0.0.0/8,
+            127.0.0.0/8,
+            169.254.0.0/16,
+            172.16.0.0/12,
+            192.168.0.0/16,
+            224.0.0.0/4,
+            240.0.0.0/4,
+            ${server_ip}/32
+        }
+    }
 
-iptables -t nat -A sstcp -d ${1}/32 -j RETURN
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        ip daddr @bypass4 return
+        ip daddr @chnroutes return
+        meta mark set 0x1
+    }
 
-iptables -t nat -A sstcp -m set --match-set chnroutes dst -j RETURN
-iptables -t nat -A sstcp -p tcp -j REDIRECT --to-ports 1081
-iptables -t nat -I PREROUTING -p tcp -j sstcp
+    chain output {
+        type filter hook output priority mangle; policy accept;
+        ip daddr @bypass4 return
+        ip daddr @chnroutes return
+        meta mark set 0x1
+    }
 
-iptables -t mangle -N ssudp
-iptables -t mangle -A ssudp -d 0.0.0.0/8 -j RETURN
-iptables -t mangle -A ssudp -d 10.0.0.0/8 -j RETURN
-iptables -t mangle -A ssudp -d 127.0.0.0/8 -j RETURN
-iptables -t mangle -A ssudp -d 169.254.0.0/16 -j RETURN
-iptables -t mangle -A ssudp -d 172.16.0.0/12 -j RETURN
-iptables -t mangle -A ssudp -d 192.168.0.0/16 -j RETURN
-iptables -t mangle -A ssudp -d 224.0.0.0/4 -j RETURN
-iptables -t mangle -A ssudp -d 240.0.0.0/4 -j RETURN
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "${tun_dev}" masquerade
+    }
 
-iptables -t mangle -A ssudp -d ${1}/32 -j RETURN
+    chain input {
+        type filter hook input priority filter; policy accept;
+        # udp2raw handles ICMP echo replies via raw sockets. Drop kernel-visible
+        # copies from the server only, so the box can still ping other hosts.
+        ip saddr ${server_ip} icmp type echo-reply drop
+    }
+}
 
-iptables -t mangle -A ssudp -d 119.29.29.29/32 -j RETURN
-iptables -t mangle -A ssudp -d 114.114.114.114/32 -j RETURN
-
-iptables -t mangle -A ssudp -m set --match-set chnroutes dst -j RETURN
-iptables -t mangle -A ssudp -p udp -j TPROXY --on-port 1081 --tproxy-mark 0x01/0x0
-iptables -t mangle -A PREROUTING -p udp -j ssudp
+include "/etc/nftables.d/chnroutes.nft"
 EOF
-chmod +x /etc/iptables/iptables.sh
+}
+
+nftables_configure_server() {
+local subnet="$1"
+local wan_iface
+wan_iface=$(detect_wan_iface)
+[[ -z "$wan_iface" ]] && exception "Could not detect WAN interface"
+
+local server_ip
+server_ip=$(get_ip)
+
+cat <<EOF > /etc/nftables.conf
+#!/usr/sbin/nft -f
+
+# Don't flush the global ruleset — coexist with xray-Reality and any other
+# services that may install rules dynamically.
+add table inet vpngw
+flush table inet vpngw
+
+table inet vpngw {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        # Anti-abuse: tunnel users can't reach the server's private nets,
+        # loopback, or back into the server's own public IP.
+        iifname "${tun_dev}" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 } drop
+        iifname "${tun_dev}" ip daddr ${server_ip} drop
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "${wan_iface}" ip saddr ${subnet}/24 masquerade
+    }
+}
+EOF
+}
+
+install_xray_reality() {
+local server_name="$1"
+[[ -z "$server_name" ]] && server_name="www.cloudflare.com"
+
+echo "------ Installing xray-core"
+bash -c "$(curl -L ${xray_install_url})" @ install
+
+echo "------ Generating Reality keys & config"
+local uuid pubkey privkey shortid keys_out
+uuid=$(xray uuid)
+keys_out=$(xray x25519)
+# xray output formats vary across versions: "Private key:" / "PrivateKey:"
+# and "Public key:" / "Password:" (newer). Match either.
+privkey=$(echo "$keys_out" | grep -E '^[Pp]rivate ?[Kk]ey' | head -1 | awk -F': *' '{print $2}')
+pubkey=$(echo "$keys_out"  | grep -E '^[Pp]ublic ?[Kk]ey|^Password' | head -1 | awk -F': *' '{print $2}')
+shortid=$(openssl rand -hex 8)
+
+cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${uuid}", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${server_name}:443",
+          "xver": 0,
+          "serverNames": ["${server_name}"],
+          "privateKey": "${privkey}",
+          "shortIds": ["", "${shortid}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" }
+  ]
+}
+EOF
+
+systemctl restart xray
+
+# Stash for the summary block.
+REALITY_UUID="$uuid"
+REALITY_PUBKEY="$pubkey"
+REALITY_SHORTID="$shortid"
+REALITY_SERVERNAME="$server_name"
 }
 
 [[ $EUID -ne 0 ]] && exception "This script must be run as root!"
@@ -211,228 +307,157 @@ fi
 
 echo "------ Install dependencies"
 apt update
-apt install git ipset unzip build-essential cmake libsodium-dev libpcre3 libpcre3-dev libssl-dev zlib1g-dev -y
-if [[ "${platform}" == "1" ]]; then
-    apt install python -y
-fi
-
-if [[ "${platform}" == "2" ]]; then
-    echo "------ Downloading release files"
-    cd /root/
-    download "overture-linux-amd64.zip" ${overture_url}
-    unzip overture-linux-amd64.zip -d /usr/local/overture
-fi
+apt install -y git build-essential nftables curl
 
 echo "------ Downloading repos"
 git clone --recursive ${tiny_vpn_repo} /root/tinyvpn
 git clone ${udp2raw_repo} /root/udp2raw
 
-if [[ "${platform}" == "1" ]]; then
-    download "3.2.2.tar.gz" ${ssr_server_url}
-elif [[ "${platform}" == "2" ]]; then
-    git clone ${ssr_client_url} /root/shadowsocksr
-fi
-
 echo "------ Compiling repos"
-
 cd /root/tinyvpn
-./makefile
-mkdir /usr/local/tinyvpn
+make -f makefile amd64
+mkdir -p /usr/local/tinyvpn
 mv tinyvpn_amd64 /usr/local/tinyvpn/tinyvpn_amd64
 
 cd /root/udp2raw
 make
-mkdir /usr/local/udp2raw
+mkdir -p /usr/local/udp2raw
 mv udp2raw /usr/local/udp2raw/udp2raw
-
-if [[ "${platform}" == "1" ]]; then
-    cd /root/
-    tar zxf 3.2.2.tar.gz
-    mv /root/shadowsocksr-3.2.2 /usr/local/shadowsocksr
-elif [[ "${platform}" == "2" ]]; then
-    cd /root/shadowsocksr
-    export CFLAGS="${CFLAGS} -Wall -O3 -pipe -Wno-format-truncation -Wno-error=format-overflow -Wno-error=pointer-arith -Wno-error=stringop-truncation -Wno-error=sizeof-pointer-memaccess"
-    ./configure --prefix=/usr/local/shadowsocksr --disable-documentation
-    make && make install
-fi
 
 if [[ "${platform}" == "2" ]]; then
     echo "------ Configuring the installation"
     echo "Enter your Server IP"
-    read -p ": " ip
-    # ToDo: check if ip is valid
-    [[ -z "${ip}" ]] && exception "Server IP must be set!"
+    read -p ": " server_ip
+    [[ -z "${server_ip}" ]] && exception "Server IP must be set!"
 fi
 
 echo "Enter tinyfecVPN sub net"
 read -p "Default(10.22.22.0): " subnet
 [[ -z "${subnet}" ]] && subnet="10.22.22.0"
 
-if [[ "${platform}" == "2" ]]; then
-    echo "Enter tinyfecVPN dev tunnel"
-    read -p "Default(tun100): " tunnel
-    [[ -z "${tunnel}" ]] && tunnel="tun100"
-fi
-
-echo "Enter your udp2raw port"
-read -p "Default(443): " port
-[[ -z "${port}" ]] && port=443
-
 echo "Enter your fec setting"
 read -p "Default(20:10): " fec
 [[ -z "${fec}" ]] && fec="20:10"
 
-echo "Enter your upd2raw/tinyfecVPN password"
+echo "Enter your udp2raw/tinyfecVPN password"
 read -p "Default(1234): " password
 [[ -z "${password}" ]] && password="1234"
 
-echo "Enter your shadowsocksr server port"
-read -p "Default(16541): " ssport
-[[ -z "${ssport}" ]] && ssport="16541"
-
-echo "Enter your shadowsocksr password"
-read -p "Default(fakeshadow): " sspwd
-[[ -z "${sspwd}" ]] && sspwd="fakeshadow"
-
-echo "------ Generating ss config file"
-if check_kernel_version && check_kernel_headers; then
-        fast_open="true"
-    else
-        fast_open="false"
+if [[ "${platform}" == "1" ]]; then
+    echo "Install xray + Reality on TCP/443? [Y/n]"
+    read -p "Default(Y): " install_reality
+    install_reality="${install_reality:-Y}"
+    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
+        echo "Reality serverName (a real TLS site to mimic)"
+        read -p "Default(www.cloudflare.com): " reality_dest
+        reality_dest="${reality_dest:-www.cloudflare.com}"
+    fi
 fi
 
-mkdir /etc/shadowsocksr
+echo "------ Generating run scripts"
+mkdir -p /etc/tinyvpn /etc/udp2raw
+
 if [[ "${platform}" == "1" ]]; then
-cat >/etc/shadowsocksr/config.json <<-EOF
-{
-    "server":"0.0.0.0",
-    "server_ipv6":"::",
-    "server_port":${ssport},
-    "local_address":"127.0.0.1",
-    "local_port":1080,
-    "password":"${sspwd}",
-    "method":"none",
-    "protocol":"origin",
-    "protocol_param":"",
-    "obfs":"plain",
-    "obfs_param":"",
-    "timeout":120,
-    "udp_timeout": 60,
-    "redirect":"",
-    "dns_ipv6":false,
-    "fast_open":${fast_open},
-    "workers":1
-}
+cat > /etc/tinyvpn/tinyvpn.sh <<EOF
+#!/usr/bin/env bash
+exec /usr/local/tinyvpn/tinyvpn_amd64 -s -l0.0.0.0:14096 -f ${fec} --sub-net ${subnet} --tun-dev ${tun_dev} -k ${password}
+EOF
+cat > /etc/udp2raw/udp2raw.sh <<EOF
+#!/usr/bin/env bash
+exec /usr/local/udp2raw/udp2raw -s -l0.0.0.0:${udp2raw_port} -r127.0.0.1:14096 --raw-mode icmp -k ${password}
 EOF
 elif [[ "${platform}" == "2" ]]; then
-cat >/etc/shadowsocksr/config.json <<-EOF
-{
-    "server": "${subnet%.0}.1",
-    "server_port": ${ssport},
-    "local_address": "0.0.0.0",
-    "local_port": 1081,
-    "password": "${sspwd}",
-    "method":"none",
-    "protocol":"origin",
-    "protocol_param":"",
-    "obfs":"plain",
-    "obfs_param":"",
-    "timeout": 120,
-    "udp_timeout": 60,
-    "fast_open": ${fast_open}
-}
+cat > /etc/tinyvpn/tinyvpn.sh <<EOF
+#!/usr/bin/env bash
+# Set up policy routing once tun100 appears. Re-runs harmlessly on tinyvpn restart
+# (rule/route adds error if already present, swallowed by '|| true').
+(
+    while ! ip link show ${tun_dev} >/dev/null 2>&1; do sleep 0.5; done
+    ip rule add fwmark 0x1/0x1 table 100 2>/dev/null || true
+    ip route add default dev ${tun_dev} table 100 2>/dev/null || true
+) &
+exec /usr/local/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:14096 -f ${fec} --sub-net ${subnet} --tun-dev ${tun_dev} --keep-reconnect -k ${password}
 EOF
-fi
-
-echo "------ Enabling services"
-create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn"
-create_service "/etc/udp2raw/udp2raw.sh" "udp2raw"
-
-if [[ "${platform}" == "1" ]]; then
-    create_service "python /usr/local/shadowsocksr/shadowsocks/server.py -c /etc/shadowsocksr/config.json" "shadowsocksr"
-fi
-
-if [[ "${platform}" == "2" ]]; then
-    create_service "/usr/local/overture/overture-linux-amd64 -c /usr/local/overture/config.yml" "overture"
-    # start overture service early so we have correct dns when curl for chnroutes
-    systemctl stop systemd-resolved
-    systemctl disable systemd-resolved
-    systemctl start overture.service
-
-    create_service "/usr/local/shadowsocksr/bin/ss-redir -c /etc/shadowsocksr/config.json -u" "shadowsocksr"
-fi
-
-echo "------ Generating start script and give them root privilege"
-mkdir /etc/tinyvpn
-mkdir /etc/udp2raw
-
-if [[ "${platform}" == "1" ]]; then
-    echo "#!/usr/bin/env bash
-    ./usr/local/tinyvpn/tinyvpn_amd64 -s -l0.0.0.0:14096 -f $fec --sub-net $subnet -k $password" >/etc/tinyvpn/tinyvpn.sh
-    echo "#!/usr/bin/env bash
-    ./usr/local/udp2raw/udp2raw -s -l0.0.0.0:$port -r127.0.0.1:14096 --raw-mode faketcp -a -k $password" >/etc/udp2raw/udp2raw.sh
-elif [[ "${platform}" == "2" ]]; then
-    echo "#!/usr/bin/env bash
-    ./usr/local/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:14096 -f $fec --sub-net $subnet --tun-dev $tunnel --keep-reconnect -k $password" >/etc/tinyvpn/tinyvpn.sh
-    echo "#!/usr/bin/env bash
-    ./usr/local/udp2raw/udp2raw -c -r$ip:$port -l 127.0.0.1:14096 --raw-mode faketcp -a -k $password" >/etc/udp2raw/udp2raw.sh
+cat > /etc/udp2raw/udp2raw.sh <<EOF
+#!/usr/bin/env bash
+exec /usr/local/udp2raw/udp2raw -c -r${server_ip}:${udp2raw_port} -l127.0.0.1:14096 --raw-mode icmp -k ${password}
+EOF
 fi
 
 chmod +x /etc/tinyvpn/tinyvpn.sh
 chmod +x /etc/udp2raw/udp2raw.sh
 
-if [[ "${platform}" == "2" ]]; then
+echo "------ Configuring services"
+if [[ "${platform}" == "1" ]]; then
+    # Server: tinyvpn must listen on :14096 before udp2raw forwards there.
+    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn"
+    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "tinyvpn.service"
+elif [[ "${platform}" == "2" ]]; then
+    # Client: udp2raw is egress; tinyvpn rides on top via 127.0.0.1:14096.
+    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw"
+    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "udp2raw.service"
+fi
 
-echo "------ Configuring iptables and ipset"
-create_chnroutes
-iptables_configure ${ip}
-/etc/cron.weekly/chnroutes
+echo "------ Enabling IP forwarding"
+enable_ip_forward
 
-cat <<EOF > /etc/systemd/system/iptables.service
-#!/usr/bin/env bash
-[Unit]
-Wants=network-online.target
-After=network-online.target
+if [[ "${platform}" == "1" ]]; then
+    echo "------ Disabling kernel ICMP echo replies"
+    enable_icmp_ignore
 
-[Service]
-Type=idle
-ExecStart=/etc/iptables/iptables.sh
+    echo "------ Configuring nftables"
+    nftables_configure_server "${subnet}"
+    systemctl enable nftables
+    systemctl restart nftables
 
-[Install]
-WantedBy=basic.target
-EOF
-systemctl enable iptables.service
-systemctl start iptables.service
+    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
+        install_xray_reality "${reality_dest}"
+    fi
+elif [[ "${platform}" == "2" ]]; then
+    echo "------ Configuring DNS over TLS"
+    configure_dns
+
+    echo "------ Configuring nftables and chnroutes"
+    nftables_configure_client "${server_ip}"
+    create_chnroutes_cron
+    /etc/cron.weekly/chnroutes
+
+    systemctl enable nftables
+    systemctl restart nftables
+fi
+
+echo "------ Starting services"
+if [[ "${platform}" == "1" ]]; then
+    # Starting udp2raw pulls in tinyvpn via Requires=
+    systemctl start udp2raw.service
+elif [[ "${platform}" == "2" ]]; then
+    # Starting tinyvpn pulls in udp2raw via Requires=
+    systemctl start tinyvpn.service
 fi
 
 echo "------ Cleaning up"
-if [[ "${platform}" == "2" ]]; then
-    enable_ipv4_forward
-fi
-systemctl start shadowsocksr.service
-systemctl start tinyvpn.service
-systemctl start udp2raw.service
-
-rm -rf /root/tinyvpn
-rm -rf /root/udp2raw
-rm -rf /root/overture
-rm -rf /root/shadowsocksr
-rm -rf /root/shadowsocksr-3.2.2
-rm -rf /root/3.2.2.tar.gz
-rm -rf /root/overture-linux-amd64.zip
-rm -rf /root/overture
+rm -rf /root/tinyvpn /root/udp2raw
 
 clear
 if [[ "${platform}" == "1" ]]; then
     echo -e "Congratulations, ${green}Server${plain} install completed!"
     echo -e "${red}Copy the info below as you need them in your client script!${plain}"
-    echo -e "Your Server IP                   : ${red} $(get_ip) ${plain}"
-    echo -e "Your tinyfecVPN sub net          : ${red} ${subnet} ${plain}"
-    echo -e "Your tinyfecVPN fec setting      : ${red} ${fec} ${plain}"
-    echo -e "Your udp2raw Port                : ${red} ${port} ${plain}"
-    echo -e "Your upd2raw/tinyfecVPN password : ${red} ${password} ${plain}"
-    echo -e "Your shadowsocksr Port           : ${red} ${ssport} ${plain}"
-    echo -e "Your shadowsocksr Password       : ${red} ${sspwd} ${plain}"
+    echo -e "Your Server IP                    : ${red} $(get_ip) ${plain}"
+    echo -e "Your tinyfecVPN sub net           : ${red} ${subnet} ${plain}"
+    echo -e "Your tinyfecVPN fec setting       : ${red} ${fec} ${plain}"
+    echo -e "Your udp2raw/tinyfecVPN password  : ${red} ${password} ${plain}"
+    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
+        echo
+        echo -e "${green}xray + Reality${plain} (configure your mobile app):"
+        echo -e "  Address       : ${red} $(get_ip) ${plain}"
+        echo -e "  Port          : ${red} 443 ${plain}"
+        echo -e "  UUID          : ${red} ${REALITY_UUID} ${plain}"
+        echo -e "  Flow          : ${red} xtls-rprx-vision ${plain}"
+        echo -e "  Public key    : ${red} ${REALITY_PUBKEY} ${plain}"
+        echo -e "  Short ID      : ${red} ${REALITY_SHORTID} ${plain}"
+        echo -e "  ServerName    : ${red} ${REALITY_SERVERNAME} ${plain}"
+        echo -e "  Fingerprint   : ${red} chrome ${plain}"
+    fi
 elif [[ "${platform}" == "2" ]]; then
     echo -e "Congratulations, ${green}Client${plain} install completed!"
 fi
