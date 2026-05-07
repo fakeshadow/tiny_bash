@@ -79,6 +79,7 @@ create_service() {
 local exec="$1"
 local name="$2"
 local deps="$3"  # optional space-separated unit list
+local caps="$4"  # required: space-separated capability list (e.g. "CAP_NET_ADMIN CAP_NET_RAW")
 local after="network-online.target"
 local requires=""
 if [[ -n "$deps" ]]; then
@@ -93,12 +94,23 @@ ${requires}
 
 [Service]
 ExecStart=${exec}
+User=tinyvpn
+Group=tinyvpn
+AmbientCapabilities=${caps}
+CapabilityBoundingSet=${caps}
+NoNewPrivileges=yes
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl enable ${name}.service
+}
+
+ensure_service_user() {
+    if ! id -u tinyvpn >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin tinyvpn
+    fi
 }
 
 create_chnroutes_cron() {
@@ -227,6 +239,15 @@ table inet vpngw {
         type nat hook postrouting priority srcnat; policy accept;
         oifname "${wan_iface}" ip saddr ${subnet}/24 masquerade
     }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        # udp2raw runs with --keep-rule and reads echo-requests via AF_PACKET
+        # before netfilter. Drop kernel-visible copies so the kernel's ICMP
+        # handler doesn't also process them. (icmp_echo_ignore_all sysctl is
+        # belt-and-suspenders; this is the netfilter-level equivalent.)
+        icmp type echo-request drop
+    }
 }
 EOF
 }
@@ -295,7 +316,10 @@ REALITY_SHORTID="$shortid"
 REALITY_SERVERNAME="$server_name"
 }
 
-[[ $EUID -ne 0 ]] && exception "This script must be run as root!"
+if [[ $EUID -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || exception "Run as root or install sudo."
+    exec sudo -E bash "$0" "$@"
+fi
 
 echo "------ Choose your platform"
 read -p "[1: Server, 2: Client]: " platform
@@ -309,17 +333,21 @@ echo "------ Install dependencies"
 apt update
 apt install -y git build-essential nftables curl
 
+ensure_service_user
+
 echo "------ Downloading repos"
-git clone --recursive ${tiny_vpn_repo} /root/tinyvpn
-git clone ${udp2raw_repo} /root/udp2raw
+build_dir=$(mktemp -d -t tinyvpn_build.XXXXXX)
+trap 'rm -rf "$build_dir"' EXIT
+git clone --recursive ${tiny_vpn_repo} "${build_dir}/tinyvpn"
+git clone ${udp2raw_repo} "${build_dir}/udp2raw"
 
 echo "------ Compiling repos"
-cd /root/tinyvpn
+cd "${build_dir}/tinyvpn"
 make -f makefile amd64
 mkdir -p /usr/local/tinyvpn
 mv tinyvpn_amd64 /usr/local/tinyvpn/tinyvpn_amd64
 
-cd /root/udp2raw
+cd "${build_dir}/udp2raw"
 make
 mkdir -p /usr/local/udp2raw
 mv udp2raw /usr/local/udp2raw/udp2raw
@@ -356,6 +384,8 @@ fi
 
 echo "------ Generating run scripts"
 mkdir -p /etc/tinyvpn /etc/udp2raw
+chgrp tinyvpn /etc/tinyvpn /etc/udp2raw
+chmod 750 /etc/tinyvpn /etc/udp2raw
 
 if [[ "${platform}" == "1" ]]; then
 cat > /etc/tinyvpn/tinyvpn.sh <<EOF
@@ -364,7 +394,7 @@ exec /usr/local/tinyvpn/tinyvpn_amd64 -s -l0.0.0.0:14096 -f ${fec} --sub-net ${s
 EOF
 cat > /etc/udp2raw/udp2raw.sh <<EOF
 #!/usr/bin/env bash
-exec /usr/local/udp2raw/udp2raw -s -l0.0.0.0:${udp2raw_port} -r127.0.0.1:14096 --raw-mode icmp -k ${password}
+exec /usr/local/udp2raw/udp2raw -s -l0.0.0.0:${udp2raw_port} -r127.0.0.1:14096 --raw-mode icmp --keep-rule -k ${password}
 EOF
 elif [[ "${platform}" == "2" ]]; then
 cat > /etc/tinyvpn/tinyvpn.sh <<EOF
@@ -380,22 +410,22 @@ exec /usr/local/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:14096 -f ${fec} --sub-net $
 EOF
 cat > /etc/udp2raw/udp2raw.sh <<EOF
 #!/usr/bin/env bash
-exec /usr/local/udp2raw/udp2raw -c -r${server_ip}:${udp2raw_port} -l127.0.0.1:14096 --raw-mode icmp -k ${password}
+exec /usr/local/udp2raw/udp2raw -c -r${server_ip}:${udp2raw_port} -l127.0.0.1:14096 --raw-mode icmp --keep-rule -k ${password}
 EOF
 fi
 
-chmod +x /etc/tinyvpn/tinyvpn.sh
-chmod +x /etc/udp2raw/udp2raw.sh
+chmod 750 /etc/tinyvpn/tinyvpn.sh /etc/udp2raw/udp2raw.sh
+chgrp tinyvpn /etc/tinyvpn/tinyvpn.sh /etc/udp2raw/udp2raw.sh
 
 echo "------ Configuring services"
 if [[ "${platform}" == "1" ]]; then
     # Server: tinyvpn must listen on :14096 before udp2raw forwards there.
-    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn"
-    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "tinyvpn.service"
+    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "" "CAP_NET_ADMIN"
+    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "tinyvpn.service" "CAP_NET_ADMIN CAP_NET_RAW"
 elif [[ "${platform}" == "2" ]]; then
     # Client: udp2raw is egress; tinyvpn rides on top via 127.0.0.1:14096.
-    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw"
-    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "udp2raw.service"
+    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "" "CAP_NET_ADMIN CAP_NET_RAW"
+    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "udp2raw.service" "CAP_NET_ADMIN"
 fi
 
 echo "------ Enabling IP forwarding"
@@ -434,9 +464,6 @@ elif [[ "${platform}" == "2" ]]; then
     # Starting tinyvpn pulls in udp2raw via Requires=
     systemctl start tinyvpn.service
 fi
-
-echo "------ Cleaning up"
-rm -rf /root/tinyvpn /root/udp2raw
 
 clear
 if [[ "${platform}" == "1" ]]; then
