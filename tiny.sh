@@ -250,10 +250,11 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
   "dns": {
     "servers": [
       { "type": "tls",   "tag": "remote", "server": "1.1.1.1",   "detour": "hy2-out" },
-      { "type": "https", "tag": "local",  "server": "223.5.5.5" }
+      { "type": "https", "tag": "china",  "server": "223.5.5.5" },
+      { "type": "local", "tag": "system" }
     ],
     "rules": [
-      { "rule_set": "geosite-cn",               "server": "local" },
+      { "rule_set": "geosite-cn",               "server": "china" },
       { "rule_set": "geosite-category-ads-all", "action": "reject" }
     ],
     "strategy": "ipv4_only",
@@ -287,30 +288,31 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
     "rule_set": [
       {
         "type": "remote", "tag": "geoip-cn", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-        "download_detour": "hy2-out", "update_interval": "168h"
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "direct", "update_interval": "168h"
       },
       {
         "type": "remote", "tag": "geosite-cn", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
-        "download_detour": "hy2-out", "update_interval": "168h"
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
+        "download_detour": "direct", "update_interval": "168h"
       },
       {
         "type": "remote", "tag": "geosite-category-ads-all", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-        "download_detour": "hy2-out", "update_interval": "168h"
+        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+        "download_detour": "direct", "update_interval": "168h"
       }
     ],
     "rules": [
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
       { "ip_is_private": true, "outbound": "direct" },
+      { "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32"], "outbound": "direct" },
       { "rule_set": "geosite-category-ads-all", "action": "reject" },
       { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }
     ],
     "final": "hy2-out",
     "auto_detect_interface": true,
-    "default_domain_resolver": "remote"
+    "default_domain_resolver": "system"
   },
   "experimental": {
     "cache_file": { "enabled": true, "path": "/var/lib/sing-box/cache.db" }
