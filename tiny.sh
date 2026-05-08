@@ -3,10 +3,15 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
 # Single-binary VPN, all inside sing-box:
-#   Server: vless+reality on TCP/443 (mobile/desktop clients)
-#         + hysteria2     on UDP/443 (gateway client below)
-#   Client: tun inbound  + hysteria2 outbound, with auto-updating
+#   Server: vless+reality on TCP/443 (mobile/desktop clients AND gateway).
+#   Client: tun inbound + vless+reality outbound, with auto-updating
 #           geoip-cn / geosite-cn rule sets (CN traffic exits direct).
+#
+# Why VLESS+Reality (TCP) and not hysteria2 (UDP/QUIC)?
+# As of 2026 the GFW extracts SNI from QUIC Initial packets and throttles
+# unrecognized flows within seconds; hysteria2 + Salamander has degraded
+# to ~68% bypass rate. VLESS+Reality imitates a real Cloudflare TLS
+# handshake at the byte level — currently the most GFW-resistant transport.
 #
 # System Required: Ubuntu 26.04
 #
@@ -72,18 +77,6 @@ install_singbox() {
     fi
 }
 
-# Self-signed cert for hysteria2's TLS layer. Hysteria2 auth still happens via
-# its own password+obfs; client uses tls.insecure=true.
-generate_self_signed_cert() {
-    local cn="$1"
-    mkdir -p /etc/sing-box/certs
-    openssl ecparam -genkey -name prime256v1 -out /etc/sing-box/certs/key.pem 2>/dev/null
-    openssl req -new -x509 -days 3650 -key /etc/sing-box/certs/key.pem \
-        -out /etc/sing-box/certs/cert.pem -subj "/CN=${cn}" 2>/dev/null
-    chown -R sing-box:sing-box /etc/sing-box/certs
-    chmod 600 /etc/sing-box/certs/key.pem
-}
-
 create_service() {
 cat <<'SVC_EOF' > /etc/systemd/system/sing-box.service
 [Unit]
@@ -112,21 +105,21 @@ SVC_EOF
     systemctl enable sing-box.service
 }
 
-# IP forwarding for client gateway mode + bigger UDP buffers for hysteria2.
+# IP forwarding for client gateway mode.
 enable_ip_forward() {
 cat <<'EOF' > /etc/sysctl.d/99-vpn.conf
 net.ipv4.ip_forward=1
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
 EOF
     sysctl --system >/dev/null
 }
 
-# Client-only: MSS clamp on forwarded TCP SYNs. Without this, LAN clients
-# negotiate MSS=1460 (Ethernet 1500 - TCP/IP 40), their TLS Certificate
-# segments don't survive QUIC encapsulation through the tun, and PMTUD
-# typically gets blackholed → handshakes hang. Clamping to the tun route
-# MTU forces both ends to use small enough segments from the start.
+# Client-only: MSS clamp on forwarded TCP SYNs. LAN clients otherwise
+# negotiate MSS=1460 (Ethernet 1500 - TCP/IP 40), oversize segments hit tun0
+# at MTU 1380, and PMTUD recovery depends on ICMP "frag needed" reaching the
+# LAN sender — which is frequently dropped by consumer routers, mobile
+# stacks, or upstream firewalls. When PMTUD blackholes, large transfers
+# (TLS Certificate, file downloads) silently stall. Clamping at SYN time
+# bypasses PMTUD entirely.
 nftables_configure_client_mss() {
 cat <<'NFTEOF' > /etc/nftables.conf
 #!/usr/sbin/nft -f
@@ -179,23 +172,12 @@ if [[ "${platform}" == "1" ]]; then
     read -p "Default(www.cloudflare.com): " reality_dest
     reality_dest="${reality_dest:-www.cloudflare.com}"
 
-    echo "Hysteria2 password"
-    read -p "Default(random): " hy2_password
-    hy2_password="${hy2_password:-$(openssl rand -hex 16)}"
-
-    echo "Hysteria2 obfs (salamander) password"
-    read -p "Default(random): " hy2_obfs
-    hy2_obfs="${hy2_obfs:-$(openssl rand -hex 16)}"
-
     echo "------ Generating Reality keys, UUID, short-id"
     keys_out=$(/usr/local/bin/sing-box generate reality-keypair)
     privkey=$(echo "$keys_out" | awk '/PrivateKey/ {print $2}')
     pubkey=$(echo "$keys_out"  | awk '/PublicKey/  {print $2}')
     uuid=$(/usr/local/bin/sing-box generate uuid)
     shortid=$(openssl rand -hex 8)
-
-    echo "------ Generating self-signed TLS cert (for hysteria2)"
-    generate_self_signed_cert "${reality_dest}"
 
     echo "------ Writing /etc/sing-box/config.json (server)"
 cat <<'CFG_EOF' > /etc/sing-box/config.json
@@ -223,19 +205,6 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
           "short_id": ["", "___SHORTID___"]
         }
       }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": 443,
-      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
-      "users": [ { "password": "___HY2_PASSWORD___" } ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "/etc/sing-box/certs/cert.pem",
-        "key_path": "/etc/sing-box/certs/key.pem"
-      }
     }
   ],
   "outbounds": [
@@ -248,23 +217,31 @@ CFG_EOF
         -e "s|___REALITY_DEST___|${reality_dest}|g" \
         -e "s|___PRIVKEY___|${privkey}|g" \
         -e "s|___SHORTID___|${shortid}|g" \
-        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
-        -e "s|___HY2_PASSWORD___|${hy2_password}|g" \
         /etc/sing-box/config.json
 
 else
     # ====== CLIENT ======
+    # All five values below are printed by the server install script — they
+    # match the server's vless+reality inbound exactly, byte for byte.
     echo "Enter your Server IP"
     read -p ": " server_ip
     [[ -z "${server_ip}" ]] && exception "Server IP must be set!"
 
-    echo "Enter Hysteria2 password (from server install)"
-    read -p ": " hy2_password
-    [[ -z "${hy2_password}" ]] && exception "Hysteria2 password must be set!"
+    echo "Enter Reality UUID (from server install)"
+    read -p ": " reality_uuid
+    [[ -z "${reality_uuid}" ]] && exception "UUID must be set!"
 
-    echo "Enter Hysteria2 obfs (salamander) password (from server install)"
-    read -p ": " hy2_obfs
-    [[ -z "${hy2_obfs}" ]] && exception "Hysteria2 obfs password must be set!"
+    echo "Enter Reality public key (from server install)"
+    read -p ": " reality_pubkey
+    [[ -z "${reality_pubkey}" ]] && exception "Public key must be set!"
+
+    echo "Enter Reality short ID (from server install)"
+    read -p ": " reality_shortid
+    [[ -z "${reality_shortid}" ]] && exception "Short ID must be set!"
+
+    echo "Enter Reality serverName (from server install)"
+    read -p "Default(www.cloudflare.com): " reality_sni
+    reality_sni="${reality_sni:-www.cloudflare.com}"
 
     echo "------ Writing /etc/sing-box/config.json (client)"
 cat <<'CFG_EOF' > /etc/sing-box/config.json
@@ -272,7 +249,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
   "log": { "level": "warn", "timestamp": true },
   "dns": {
     "servers": [
-      { "type": "tls",   "tag": "remote", "server": "1.1.1.1",   "detour": "hy2-out" },
+      { "type": "tls",   "tag": "remote", "server": "1.1.1.1",   "detour": "reality-out" },
       { "type": "https", "tag": "china",  "server": "223.5.5.5" },
       { "type": "local", "tag": "system" }
     ],
@@ -297,13 +274,22 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
   ],
   "outbounds": [
     {
-      "type": "hysteria2",
-      "tag": "hy2-out",
+      "type": "vless",
+      "tag": "reality-out",
       "server": "___SERVER_IP___",
       "server_port": 443,
-      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
-      "password": "___HY2_PASSWORD___",
-      "tls": { "enabled": true, "insecure": true }
+      "uuid": "___UUID___",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "___SNI___",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": {
+          "enabled": true,
+          "public_key": "___PUBKEY___",
+          "short_id": "___SHORTID___"
+        }
+      }
     },
     { "type": "direct", "tag": "direct" }
   ],
@@ -333,7 +319,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
       { "rule_set": "geosite-category-ads-all", "action": "reject" },
       { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }
     ],
-    "final": "hy2-out",
+    "final": "reality-out",
     "auto_detect_interface": true,
     "default_domain_resolver": "system"
   },
@@ -344,8 +330,10 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
 CFG_EOF
     sed -i \
         -e "s|___SERVER_IP___|${server_ip}|g" \
-        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
-        -e "s|___HY2_PASSWORD___|${hy2_password}|g" \
+        -e "s|___UUID___|${reality_uuid}|g" \
+        -e "s|___PUBKEY___|${reality_pubkey}|g" \
+        -e "s|___SHORTID___|${reality_shortid}|g" \
+        -e "s|___SNI___|${reality_sni}|g" \
         /etc/sing-box/config.json
 fi
 
@@ -380,7 +368,7 @@ clear
 if [[ "${platform}" == "1" ]]; then
     echo -e "Congratulations, ${green}Server${plain} install completed!"
     echo
-    echo -e "${green}Reality (TCP/443)${plain} — for mobile / desktop clients (v2rayNG, etc.):"
+    echo -e "${green}Reality (TCP/443)${plain} — for both mobile / desktop clients AND the gateway:"
     echo -e "  Address      : ${red} $(get_ip) ${plain}"
     echo -e "  Port         : ${red} 443 ${plain}"
     echo -e "  UUID         : ${red} ${uuid} ${plain}"
@@ -390,14 +378,7 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  ServerName   : ${red} ${reality_dest} ${plain}"
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
-    echo -e "${green}Hysteria2 (UDP/443)${plain} — for the gateway client below:"
-    echo -e "  Address          : ${red} $(get_ip) ${plain}"
-    echo -e "  Port             : ${red} 443 ${plain}"
-    echo -e "  Password         : ${red} ${hy2_password} ${plain}"
-    echo -e "  Salamander obfs  : ${red} ${hy2_obfs} ${plain}"
-    echo -e "  TLS              : ${red} self-signed (client uses insecure) ${plain}"
-    echo
-    echo -e "${red}Save the values above — you'll need them on the client!${plain}"
+    echo -e "${red}Save the values above — the client install will ask for all of them.${plain}"
 elif [[ "${platform}" == "2" ]]; then
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "To use this machine as a gateway, set other devices' default gateway to its LAN IP."
