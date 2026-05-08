@@ -268,6 +268,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
       "address": ["172.19.0.1/30"],
       "mtu": 1380,
       "auto_route": true,
+      "auto_redirect": true,
       "strict_route": true,
       "stack": "system"
     }
