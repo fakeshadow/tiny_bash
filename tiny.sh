@@ -54,6 +54,24 @@ xray_url_templates=(
 # Per xtls.github.io tproxy.html the default is 12345; no reason to change.
 tproxy_port=12345
 
+# CN-route bypass: weekly-refreshed list of CN-bound CIDRs loaded into an
+# nftables set. Packets to those destinations RETURN early (skip TPROXY)
+# and reach the local network direct via the kernel's normal forwarding
+# path — zero userspace hop, full LAN throughput.
+#
+# Source: misakaio/chnroutes2 (BGP-derived, hourly upstream refresh, was
+# already used by the original tiny.sh). IPv6 list isn't published by this
+# project; v4 only.
+#
+# Each entry below was probed live (HTTP 200 + real CIDR file body), same
+# proxies that work for the xray binary download.
+chnroutes_url_templates=(
+    "https://gh-proxy.com/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://ghfast.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://gh.ddlc.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+)
+
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -209,6 +227,18 @@ XRAYSVC_EOF
 # `streamSettings.sockopt.mark = 255` (0xff) makes xray's own outbound
 # traffic carry fwmark 0xff so the nftables rule below can RETURN it
 # without sending it back through TPROXY (loop avoidance).
+#
+# Note: sniffing.routeOnly is FALSE here, deviating from the SOCKS5-style
+# template in Xray-examples (which uses true). The reason is that this is
+# a transparent gateway — LAN clients pre-resolve hostnames via their own
+# DNS, which gives them region-local edge IPs (CN-routed for CN clients).
+# If we keep routeOnly:true, xray forwards "connect to <LAN-resolved-IP>"
+# to the server, and the overseas server's outbound dial lands on a CN
+# edge from a non-CN source. Strict geo-CDN sites (YouTube/googlevideo,
+# some Akamai-fronted sites) RST that mid-TLS-handshake. With
+# routeOnly:false, xray forwards the sniffed SNI hostname instead, and
+# the server resolves it via its own DNS — source/destination regions
+# match, the edge serves the request normally.
 write_xray_client_config() {
     local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5" spiderx="$6"
 cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
@@ -227,7 +257,7 @@ cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
       "sniffing": {
         "enabled": true,
         "destOverride": ["http", "tls", "quic"],
-        "routeOnly": true
+        "routeOnly": false
       },
       "streamSettings": {
         "sockopt": { "tproxy": "tproxy" }
@@ -330,6 +360,13 @@ add table inet xray
 flush table inet xray
 
 table inet xray {
+    # CN-route bypass set. Populated/refreshed by /usr/local/sbin/update-chnroutes
+    # via the include directive at the bottom of this file.
+    set cn_ipv4 {
+        type ipv4_addr
+        flags interval
+    }
+
     chain prerouting {
         type filter hook prerouting priority filter; policy accept;
 
@@ -352,14 +389,100 @@ table inet xray {
         #    via streamSettings.sockopt.mark) bypass TPROXY.
         meta mark 0x000000ff return
 
-        # 5. Everything else: TPROXY to xray, mark with 0x1 so the policy
+        # 5. CN-bound traffic bypasses the proxy entirely — let the
+        #    kernel's normal forwarding path send it out via WAN direct.
+        ip daddr @cn_ipv4 return
+
+        # 6. Everything else: TPROXY to xray, mark with 0x1 so the policy
         #    routing rule below delivers the packet to the local socket.
         meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip to 127.0.0.1:___TPROXY_PORT___ accept
         meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip6 to [::1]:___TPROXY_PORT___ accept
     }
 }
+
+# Populated weekly by /etc/cron.weekly/update-chnroutes. The file must
+# exist (even as a placeholder) for nftables.service to start cleanly.
+include "/etc/nftables.d/chnroutes.nft"
 NFTEOF
     sed -i "s|___TPROXY_PORT___|${tproxy_port}|g" /etc/nftables.conf
+}
+
+# Writes the chnroutes updater + its weekly cron + an empty placeholder
+# for the included nftables fragment. The placeholder is required because
+# /etc/nftables.conf does `include "/etc/nftables.d/chnroutes.nft"` and
+# nftables.service fails to start if the file is missing.
+write_chnroutes_assets() {
+    mkdir -p /etc/nftables.d
+    if [[ ! -f /etc/nftables.d/chnroutes.nft ]]; then
+        echo "# placeholder — populated by /usr/local/sbin/update-chnroutes" \
+            > /etc/nftables.d/chnroutes.nft
+    fi
+
+cat <<'UPD_EOF' > /usr/local/sbin/update-chnroutes
+#!/usr/bin/env bash
+# Refresh /etc/nftables.d/chnroutes.nft with the latest CN CIDR list,
+# then atomically reload it into the live `inet xray.cn_ipv4` set.
+# Source: misakaio/chnroutes2 (BGP-derived, hourly upstream refresh).
+set -euo pipefail
+
+URLS=(
+    "https://gh-proxy.com/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://ghfast.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://gh.ddlc.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+    "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+)
+
+OUT=/etc/nftables.d/chnroutes.nft
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+fetched=
+for url in "${URLS[@]}"; do
+    if curl -fsSL --connect-timeout 8 --max-time 60 "$url" -o "$TMP/raw.txt"; then
+        echo "[update-chnroutes] fetched: $url" >&2
+        fetched=1
+        break
+    fi
+    echo "[update-chnroutes] failed: $url" >&2
+done
+[[ "$fetched" ]] || { echo "[update-chnroutes] all mirrors failed" >&2; exit 1; }
+
+# Strip comments + empty lines.
+grep -Ev '^$|^#' "$TMP/raw.txt" > "$TMP/cidrs.txt"
+
+count=$(wc -l < "$TMP/cidrs.txt")
+if [[ "$count" -lt 1000 ]]; then
+    echo "[update-chnroutes] sanity fail: only $count CIDRs (expected >=1000)" >&2
+    exit 1
+fi
+
+# Build the include file: flush the existing set, then bulk-add the new
+# CIDRs. nft applies the file as a single transaction → atomic update.
+{
+    echo "# Auto-generated by /usr/local/sbin/update-chnroutes"
+    echo "# Source: misakaio/chnroutes2 — refreshed $(date -u +%FT%TZ)"
+    echo "flush set inet xray cn_ipv4"
+    echo "add element inet xray cn_ipv4 { $(paste -sd, "$TMP/cidrs.txt") }"
+} > "$OUT.new"
+mv "$OUT.new" "$OUT"
+
+# Apply atomically without disturbing other rules in the table.
+if ! nft -f "$OUT" 2> "$TMP/nft.err"; then
+    cat "$TMP/nft.err" >&2
+    exit 1
+fi
+
+echo "[update-chnroutes] loaded $count CIDRs into inet xray.cn_ipv4" >&2
+UPD_EOF
+    chmod +x /usr/local/sbin/update-chnroutes
+
+    mkdir -p /etc/cron.weekly
+cat <<'CRON_EOF' > /etc/cron.weekly/update-chnroutes
+#!/bin/sh
+# Refresh CN routes; output goes to syslog/journal.
+exec /usr/local/sbin/update-chnroutes
+CRON_EOF
+    chmod +x /etc/cron.weekly/update-chnroutes
 }
 
 # Policy routing: packets fwmark'd with 0x1 by the TPROXY rule are routed
@@ -422,7 +545,7 @@ echo "------ Install dependencies"
 apt update
 # nftables is needed by the client (TPROXY rules); curl/openssl/tar are
 # common to both modes (singbox download / reality keys / xray installer).
-apt install -y curl ca-certificates openssl tar nftables iproute2 unzip
+apt install -y curl ca-certificates openssl tar nftables iproute2 unzip cron
 
 if [[ "${platform}" == "1" ]]; then
     # ============================ SERVER =================================
@@ -542,6 +665,9 @@ else
     echo "------ Writing /etc/nftables.conf (TPROXY rules)"
     write_tproxy_nftables
 
+    echo "------ Installing chnroutes updater + weekly cron"
+    write_chnroutes_assets
+
     echo "------ Writing tproxy-route.service (policy routing for fwmark 0x1)"
     write_tproxy_route_service
 
@@ -556,6 +682,14 @@ else
     systemctl restart nftables
     systemctl restart tproxy-route.service
     systemctl restart xray.service
+
+    echo "------ Populating chnroutes (initial fetch)"
+    if /usr/local/sbin/update-chnroutes; then
+        echo -e "[${green}OK${plain}] chnroutes loaded; CN traffic will bypass the proxy."
+    else
+        echo -e "[${yellow}Warn${plain}] chnroutes initial fetch failed — gateway works without CN bypass."
+        echo -e "[${yellow}Warn${plain}] Weekly cron will retry; manual: ${yellow}sudo /usr/local/sbin/update-chnroutes${plain}"
+    fi
 
     sleep 2
     if ! systemctl is-active --quiet xray; then
