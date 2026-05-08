@@ -29,12 +29,15 @@ export PATH
 # Server uses sing-box. Bump as needed: https://github.com/SagerNet/sing-box/releases
 singbox_version="1.13.11"
 singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
-singbox_url_mirror="https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
 
-# Client uses xray. Installed via the project's official one-liner — same
-# tooling used by OpenWrt's luci-app-xray, OpenClash and others, so any
-# breakage shows up in those communities first.
-xray_install_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+# Client uses xray. Bump as needed: https://github.com/XTLS/Xray-core/releases
+xray_version="26.3.27"
+# SourceForge hosts an exact mirror of XTLS/Xray-core (Cloudflare-fronted,
+# generally reachable from mainland China where github.com is not).
+# Reference: https://sourceforge.net/projects/xray-core.mirror/files/
+xray_url_mirror="https://sourceforge.net/projects/xray-core.mirror/files/v%s/Xray-linux-%s.zip/download"
+# GitHub fallback (used on server / where direct GitHub works).
+xray_url_gh="https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
 
 # TPROXY listening port on the gateway (xray's dokodemo-door inbound).
 # Per xtls.github.io tproxy.html the default is 12345; no reason to change.
@@ -111,12 +114,65 @@ SVC_EOF
 
 # --- client-only helpers (xray + TPROXY) ----------------------------------
 
-# Use the project-maintained installer. It writes /usr/local/bin/xray and
-# /etc/systemd/system/xray.service with User=nobody + AmbientCapabilities
-# including CAP_NET_ADMIN already, which is what TPROXY needs — confirmed
-# by reading XTLS/Xray-install/install-release.sh.
+# Try a single URL. Returns 0 on success, nonzero on download/extract
+# failure so the caller can fall through to another mirror.
+install_xray_from() {
+    local url="$1"
+    local tmp
+    tmp=$(mktemp -d)
+    trap "rm -rf '$tmp'" RETURN
+    curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp/xray.zip" || return 1
+    unzip -q "$tmp/xray.zip" -d "$tmp/x" || return 1
+    install -m 755 "$tmp/x/xray" /usr/local/bin/xray
+    mkdir -p /usr/local/etc/xray
+}
+
+# SourceForge mirror first (CN-friendly), GitHub direct as fallback.
 install_xray() {
-    bash -c "$(curl -L ${xray_install_url})" @ install || exception "xray install failed"
+    local v="${xray_version}"
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="64" ;;
+        aarch64|arm64) arch="arm64-v8a" ;;
+        *) exception "Unsupported architecture for xray: $(uname -m)" ;;
+    esac
+    local mirror gh
+    mirror=$(printf "${xray_url_mirror}" "$v" "$arch")
+    gh=$(printf "${xray_url_gh}" "$v" "$arch")
+    echo "------ Installing xray ${v} (SourceForge mirror)"
+    if ! install_xray_from "$mirror"; then
+        echo "[${yellow}Warn${plain}] Mirror failed, falling back to GitHub direct..."
+        install_xray_from "$gh" || exception "Failed to download xray ${v} from mirror or GitHub"
+    fi
+}
+
+# Replicates the systemd unit that XTLS/Xray-install/install-release.sh
+# generates — User=nobody, ambient CAP_NET_ADMIN (needed for TPROXY bind),
+# CAP_NET_BIND_SERVICE for low ports, RestartPreventExitStatus=23
+# (xray's "configuration error" exit code, so a bad config doesn't churn).
+create_xray_service() {
+cat <<'XRAYSVC_EOF' > /etc/systemd/system/xray.service
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+XRAYSVC_EOF
+    systemctl daemon-reload
+    systemctl enable xray.service
 }
 
 # Client config. Inbound block is the dokodemo-door TPROXY pattern from
@@ -339,7 +395,7 @@ echo "------ Install dependencies"
 apt update
 # nftables is needed by the client (TPROXY rules); curl/openssl/tar are
 # common to both modes (singbox download / reality keys / xray installer).
-apt install -y curl ca-certificates openssl tar nftables iproute2
+apt install -y curl ca-certificates openssl tar nftables iproute2 unzip
 
 if [[ "${platform}" == "1" ]]; then
     # ============================ SERVER =================================
@@ -450,7 +506,6 @@ else
     read -p "Default(empty): " reality_spiderx
 
     if ! command -v xray >/dev/null 2>&1; then
-        echo "------ Installing xray (XTLS/Xray-install)"
         install_xray
     fi
 
@@ -462,6 +517,9 @@ else
 
     echo "------ Writing tproxy-route.service (policy routing for fwmark 0x1)"
     write_tproxy_route_service
+
+    echo "------ Writing /etc/systemd/system/xray.service"
+    create_xray_service
 
     echo "------ Enabling IP forwarding"
     enable_ip_forward
