@@ -32,12 +32,23 @@ singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-
 
 # Client uses xray. Bump as needed: https://github.com/XTLS/Xray-core/releases
 xray_version="26.3.27"
-# SourceForge hosts an exact mirror of XTLS/Xray-core (Cloudflare-fronted,
-# generally reachable from mainland China where github.com is not).
-# Reference: https://sourceforge.net/projects/xray-core.mirror/files/
-xray_url_mirror="https://sourceforge.net/projects/xray-core.mirror/files/v%s/Xray-linux-%s.zip/download"
-# GitHub fallback (used on server / where direct GitHub works).
-xray_url_gh="https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+# Ordered list of URL templates for the xray-core release zip. The script
+# tries each in order and uses the first one that responds. Two %s slots:
+# the version (without leading "v"), and the arch tag ("64" or "arm64-v8a").
+#
+# No single CN-friendly mirror is reliably up — what works rotates over time.
+# If you find a better mirror, prepend it to this list. If they all die,
+# the manual escape hatch is documented in install_xray() below.
+# Each entry below was probed at script-write time: HTTP 200 + a real ZIP
+# header byte (50 4b 03 04) on a range-GET, not just a HEAD ping. If you
+# find a better mirror (or one of these dies), prepend/swap freely.
+xray_url_templates=(
+    "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+    "https://kkgithub.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+    "https://gh.ddlc.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+    "https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+)
 
 # TPROXY listening port on the gateway (xray's dokodemo-door inbound).
 # Per xtls.github.io tproxy.html the default is 12345; no reason to change.
@@ -121,13 +132,26 @@ install_xray_from() {
     local tmp
     tmp=$(mktemp -d)
     trap "rm -rf '$tmp'" RETURN
-    curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp/xray.zip" || return 1
+    # Aggressive connect timeout so dead mirrors fail fast (we have several
+    # to try). max-time stays generous for the 21MB transfer over slow links.
+    curl -fsSL --connect-timeout 8 --max-time 180 "$url" -o "$tmp/xray.zip" || return 1
     unzip -q "$tmp/xray.zip" -d "$tmp/x" || return 1
     install -m 755 "$tmp/x/xray" /usr/local/bin/xray
     mkdir -p /usr/local/etc/xray
 }
 
-# SourceForge mirror first (CN-friendly), GitHub direct as fallback.
+# Tries each entry of xray_url_templates in order. First success wins.
+#
+# Manual escape hatch — if all mirrors fail in your network:
+#   1. From any machine with working GitHub access (e.g. your overseas
+#      server), download and copy the zip to the gateway:
+#        wget https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-linux-64.zip
+#        scp Xray-linux-64.zip gateway:/tmp/
+#   2. On the gateway: pre-place the binary so this script's `command -v
+#      xray` check short-circuits the download:
+#        sudo unzip /tmp/Xray-linux-64.zip -d /tmp/xray
+#        sudo install -m 755 /tmp/xray/xray /usr/local/bin/xray
+#   3. Re-run sudo ./tiny.sh — install_xray will be skipped entirely.
 install_xray() {
     local v="${xray_version}"
     local arch
@@ -136,14 +160,17 @@ install_xray() {
         aarch64|arm64) arch="arm64-v8a" ;;
         *) exception "Unsupported architecture for xray: $(uname -m)" ;;
     esac
-    local mirror gh
-    mirror=$(printf "${xray_url_mirror}" "$v" "$arch")
-    gh=$(printf "${xray_url_gh}" "$v" "$arch")
-    echo "------ Installing xray ${v} (SourceForge mirror)"
-    if ! install_xray_from "$mirror"; then
-        echo "[${yellow}Warn${plain}] Mirror failed, falling back to GitHub direct..."
-        install_xray_from "$gh" || exception "Failed to download xray ${v} from mirror or GitHub"
-    fi
+    local tmpl url
+    for tmpl in "${xray_url_templates[@]}"; do
+        url=$(printf "${tmpl}" "$v" "$arch")
+        echo "------ Trying: ${url}"
+        if install_xray_from "$url"; then
+            echo "[${green}OK${plain}] xray ${v} installed."
+            return 0
+        fi
+        echo "[${yellow}Warn${plain}] Failed; trying next mirror..."
+    done
+    exception "All xray mirrors failed. See manual escape hatch in install_xray() comment in tiny.sh."
 }
 
 # Replicates the systemd unit that XTLS/Xray-install/install-release.sh
