@@ -2,27 +2,25 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# Server/Client script for tinyfecVPN + udp2raw (ICMP mode), with optional
-# xray-Reality on TCP/443 for mobile clients (server only).
-
-# System Required: Ubuntu 24.04
-
+# Single-binary VPN, all inside sing-box:
+#   Server: vless+reality on TCP/443 (mobile/desktop clients)
+#         + hysteria2     on UDP/443 (gateway client below)
+#   Client: tun inbound  + hysteria2 outbound, with auto-updating
+#           geoip-cn / geosite-cn rule sets (CN traffic exits direct).
+#
+# System Required: Ubuntu 26.04
+#
 # Important:
-# This script is for learning bash operations. Please delete all the compiled files after you done with it.
+# This script is for learning bash operations.
 
-# Credits:
-# @Teddysun <i@teddysun.com> for copy paste scripts
-
-# links
-tiny_vpn_repo="https://github.com/wangyu-/tinyfecVPN.git"
-udp2raw_repo="https://github.com/wangyu-/udp2raw-tunnel.git"
-chnroutes_url="https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-xray_install_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-
-# udp2raw uses port numbers as internal multiplexing tags in icmp mode; not on the wire.
-udp2raw_port=4096
-# tinyvpn tun device name; same on both sides for nftables references.
-tun_dev="tun100"
+# Pin a sing-box release. Bump as needed: https://github.com/SagerNet/sing-box/releases
+singbox_version="1.13.11"
+# Server pulls direct from GitHub (overseas host → fast).
+singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
+# Client may sit behind the GFW where GitHub is slow/unreliable. ghfast.top
+# fronts GitHub releases. Swap to another mirror if this one rots —
+# alternatives: mirror.ghproxy.com, gh-proxy.com, github.moeyy.xyz, github.akams.cn.
+singbox_url_mirror="https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -40,281 +38,93 @@ get_ip(){
     echo ${IP}
 }
 
-detect_wan_iface() {
-    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1
-}
-
-enable_ip_forward() {
-cat <<'EOF' > /etc/sysctl.d/99-vpn.conf
-net.ipv4.ip_forward=1
-EOF
-sysctl --system >/dev/null
-}
-
-enable_icmp_ignore() {
-cat <<'EOF' > /etc/sysctl.d/99-udp2raw-icmp.conf
-# udp2raw uses ICMP raw sockets in --raw-mode icmp. Stop the kernel from
-# auto-replying to pings, otherwise its replies fight with udp2raw's own.
-# Side effect: server can no longer be pinged from anywhere — use TCP-based
-# liveness checks instead.
-net.ipv4.icmp_echo_ignore_all=1
-EOF
-sysctl --system >/dev/null
-}
-
-configure_dns() {
-mkdir -p /etc/systemd/resolved.conf.d
-cat <<'EOF' > /etc/systemd/resolved.conf.d/dot.conf
-[Resolve]
-DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
-FallbackDNS=9.9.9.9#dns.quad9.net
-DNSOverTLS=yes
-DNSSEC=allow-downgrade
-Cache=yes
-EOF
-systemctl restart systemd-resolved
-}
-
-create_service() {
-local exec="$1"
-local name="$2"
-local deps="$3"  # optional space-separated unit list
-local caps="$4"  # required: space-separated capability list (e.g. "CAP_NET_ADMIN CAP_NET_RAW")
-local after="network-online.target"
-local requires=""
-if [[ -n "$deps" ]]; then
-    after="${after} ${deps}"
-    requires="Requires=${deps}"
-fi
-cat <<EOF > /etc/systemd/system/${name}.service
-[Unit]
-Wants=network-online.target
-After=${after}
-${requires}
-
-[Service]
-ExecStart=${exec}
-User=tinyvpn
-Group=tinyvpn
-AmbientCapabilities=${caps}
-CapabilityBoundingSet=${caps}
-NoNewPrivileges=yes
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable ${name}.service
-}
-
 ensure_service_user() {
-    if ! id -u tinyvpn >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin tinyvpn
+    if ! id -u sing-box >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin sing-box
     fi
 }
 
-create_chnroutes_cron() {
-mkdir -p /etc/nftables.d
-# Placeholder so the include in /etc/nftables.conf parses on first boot.
-[[ -f /etc/nftables.d/chnroutes.nft ]] || echo "# populated by /etc/cron.weekly/chnroutes" > /etc/nftables.d/chnroutes.nft
+# Try a single URL. Returns 0 on success, nonzero on download/extract failure
+# so the caller can fall through to another mirror.
+install_singbox_from() {
+    local url="$1"
+    local tmp
+    tmp=$(mktemp -d)
+    trap "rm -rf '$tmp'" RETURN
+    curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp/sb.tar.gz" || return 1
+    tar -xzf "$tmp/sb.tar.gz" -C "$tmp" --strip-components=1 || return 1
+    install -m 755 "$tmp/sing-box" /usr/local/bin/sing-box
+}
 
-cat <<EOF > /etc/cron.weekly/chnroutes
-#!/usr/bin/env bash
-set -e
+# Server: GitHub direct only. Client: mirror first, then GitHub as fallback.
+install_singbox() {
+    local v="${singbox_version}"
+    local gh mirror
+    gh=$(printf "${singbox_url_gh}" "$v" "$v")
+    mirror=$(printf "${singbox_url_mirror}" "$v" "$v")
+    if [[ "${platform}" == "1" ]]; then
+        install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
+    else
+        if ! install_singbox_from "$mirror"; then
+            echo "[${yellow}Warn${plain}] Mirror failed, falling back to GitHub direct..."
+            install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from mirror or GitHub"
+        fi
+    fi
+}
 
-URL="${chnroutes_url}"
-OUTPUT="/etc/nftables.d/chnroutes.nft"
-TMP=\$(mktemp)
-trap 'rm -f "\$TMP"' EXIT
+# Self-signed cert for hysteria2's TLS layer. Hysteria2 auth still happens via
+# its own password+obfs; client uses tls.insecure=true.
+generate_self_signed_cert() {
+    local cn="$1"
+    mkdir -p /etc/sing-box/certs
+    openssl ecparam -genkey -name prime256v1 -out /etc/sing-box/certs/key.pem 2>/dev/null
+    openssl req -new -x509 -days 3650 -key /etc/sing-box/certs/key.pem \
+        -out /etc/sing-box/certs/cert.pem -subj "/CN=${cn}" 2>/dev/null
+    chown -R sing-box:sing-box /etc/sing-box/certs
+    chmod 600 /etc/sing-box/certs/key.pem
+}
 
-curl -sL "\$URL" | grep -Ev '^\$|^#' > "\$TMP"
+create_service() {
+cat <<'SVC_EOF' > /etc/systemd/system/sing-box.service
+[Unit]
+Description=sing-box service
+Wants=network-online.target
+After=network-online.target nss-lookup.target
 
-if [[ ! -s "\$TMP" ]] || [[ \$(wc -l < "\$TMP") -lt 1000 ]]; then
-    echo "chnroutes download looks bad, aborting" >&2
-    exit 1
-fi
+[Service]
+User=sing-box
+Group=sing-box
+ExecStart=/usr/local/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
 
-{
-    echo "add element inet vpngw chnroutes {"
-    paste -sd, "\$TMP"
-    echo "}"
-} > "\$OUTPUT.new"
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+    mkdir -p /var/lib/sing-box
+    chown -R sing-box:sing-box /var/lib/sing-box /etc/sing-box
+    systemctl daemon-reload
+    systemctl enable sing-box.service
+}
 
-mv "\$OUTPUT.new" "\$OUTPUT"
-nft -f /etc/nftables.conf
+# IP forwarding for client gateway mode + bigger UDP buffers for hysteria2.
+enable_ip_forward() {
+cat <<'EOF' > /etc/sysctl.d/99-vpn.conf
+net.ipv4.ip_forward=1
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
 EOF
-chmod +x /etc/cron.weekly/chnroutes
+    sysctl --system >/dev/null
 }
 
-nftables_configure_client() {
-local server_ip="$1"
-cat <<EOF > /etc/nftables.conf
-#!/usr/sbin/nft -f
-
-# Idempotent: declare-then-flush so re-runs replace cleanly without affecting
-# any other tables.
-add table inet vpngw
-flush table inet vpngw
-
-table inet vpngw {
-    set chnroutes {
-        type ipv4_addr
-        flags interval
-    }
-
-    set bypass4 {
-        type ipv4_addr
-        flags interval
-        elements = {
-            0.0.0.0/8,
-            10.0.0.0/8,
-            127.0.0.0/8,
-            169.254.0.0/16,
-            172.16.0.0/12,
-            192.168.0.0/16,
-            224.0.0.0/4,
-            240.0.0.0/4,
-            ${server_ip}/32
-        }
-    }
-
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
-        ip daddr @bypass4 return
-        ip daddr @chnroutes return
-        meta mark set 0x1
-    }
-
-    chain output {
-        type filter hook output priority mangle; policy accept;
-        ip daddr @bypass4 return
-        ip daddr @chnroutes return
-        meta mark set 0x1
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        oifname "${tun_dev}" masquerade
-    }
-
-    chain input {
-        type filter hook input priority filter; policy accept;
-        # udp2raw handles ICMP echo replies via raw sockets. Drop kernel-visible
-        # copies from the server only, so the box can still ping other hosts.
-        ip saddr ${server_ip} icmp type echo-reply drop
-    }
-}
-
-include "/etc/nftables.d/chnroutes.nft"
-EOF
-}
-
-nftables_configure_server() {
-local subnet="$1"
-local wan_iface
-wan_iface=$(detect_wan_iface)
-[[ -z "$wan_iface" ]] && exception "Could not detect WAN interface"
-
-local server_ip
-server_ip=$(get_ip)
-
-cat <<EOF > /etc/nftables.conf
-#!/usr/sbin/nft -f
-
-# Don't flush the global ruleset — coexist with xray-Reality and any other
-# services that may install rules dynamically.
-add table inet vpngw
-flush table inet vpngw
-
-table inet vpngw {
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        # Anti-abuse: tunnel users can't reach the server's private nets,
-        # loopback, or back into the server's own public IP.
-        iifname "${tun_dev}" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 } drop
-        iifname "${tun_dev}" ip daddr ${server_ip} drop
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        oifname "${wan_iface}" ip saddr ${subnet}/24 masquerade
-    }
-
-    chain input {
-        type filter hook input priority filter; policy accept;
-        # udp2raw runs with --keep-rule and reads echo-requests via AF_PACKET
-        # before netfilter. Drop kernel-visible copies so the kernel's ICMP
-        # handler doesn't also process them. (icmp_echo_ignore_all sysctl is
-        # belt-and-suspenders; this is the netfilter-level equivalent.)
-        icmp type echo-request drop
-    }
-}
-EOF
-}
-
-install_xray_reality() {
-local server_name="$1"
-[[ -z "$server_name" ]] && server_name="www.cloudflare.com"
-
-echo "------ Installing xray-core"
-bash -c "$(curl -L ${xray_install_url})" @ install
-
-echo "------ Generating Reality keys & config"
-local uuid pubkey privkey shortid keys_out
-uuid=$(xray uuid)
-keys_out=$(xray x25519)
-# xray output formats vary across versions: "Private key:" / "PrivateKey:"
-# and "Public key:" / "Password:" (newer). Match either.
-privkey=$(echo "$keys_out" | grep -E '^[Pp]rivate ?[Kk]ey' | head -1 | awk -F': *' '{print $2}')
-pubkey=$(echo "$keys_out"  | grep -E '^[Pp]ublic ?[Kk]ey|^Password' | head -1 | awk -F': *' '{print $2}')
-shortid=$(openssl rand -hex 8)
-
-cat > /usr/local/etc/xray/config.json <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "${uuid}", "flow": "xtls-rprx-vision" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${server_name}:443",
-          "xver": 0,
-          "serverNames": ["${server_name}"],
-          "privateKey": "${privkey}",
-          "shortIds": ["", "${shortid}"]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" }
-  ]
-}
-EOF
-
-systemctl restart xray
-
-# Stash for the summary block.
-REALITY_UUID="$uuid"
-REALITY_PUBKEY="$pubkey"
-REALITY_SHORTID="$shortid"
-REALITY_SERVERNAME="$server_name"
-}
+# All heredocs use quoted delimiters (<<'X') with ___PLACEHOLDER___ tokens
+# replaced via sed. Avoids bash mangling values that start with digits
+# (e.g. IPs like 199.x.x.x).
 
 if [[ $EUID -ne 0 ]]; then
     command -v sudo >/dev/null 2>&1 || exception "Run as root or install sudo."
@@ -324,167 +134,244 @@ fi
 echo "------ Choose your platform"
 read -p "[1: Server, 2: Client]: " platform
 [[ -z "${platform}" ]] && exception "Must choose your platform!"
-
-if [[ "${platform}" != "1"  ]] &&  [[ "${platform}" != "2"  ]] ; then
-        exception "Platform must be ${yellow}1${plain}(Server) or ${yellow}2${plain}(Client)!"
+if [[ "${platform}" != "1" ]] && [[ "${platform}" != "2" ]]; then
+    exception "Platform must be ${yellow}1${plain}(Server) or ${yellow}2${plain}(Client)!"
 fi
 
 echo "------ Install dependencies"
 apt update
-apt install -y git build-essential nftables curl
+apt install -y curl ca-certificates openssl tar
 
 ensure_service_user
+mkdir -p /etc/sing-box
 
-echo "------ Downloading repos"
-build_dir=$(mktemp -d -t tinyvpn_build.XXXXXX)
-trap 'rm -rf "$build_dir"' EXIT
-git clone --recursive ${tiny_vpn_repo} "${build_dir}/tinyvpn"
-git clone ${udp2raw_repo} "${build_dir}/udp2raw"
+if ! command -v sing-box >/dev/null 2>&1; then
+    echo "------ Installing sing-box ${singbox_version}"
+    install_singbox
+fi
 
-echo "------ Compiling repos"
-cd "${build_dir}/tinyvpn"
-make -f makefile amd64
-mkdir -p /usr/local/tinyvpn
-mv tinyvpn_amd64 /usr/local/tinyvpn/tinyvpn_amd64
+if [[ "${platform}" == "1" ]]; then
+    # ====== SERVER ======
+    echo "Reality serverName (a real TLS site to mimic)"
+    read -p "Default(www.cloudflare.com): " reality_dest
+    reality_dest="${reality_dest:-www.cloudflare.com}"
 
-cd "${build_dir}/udp2raw"
-make
-mkdir -p /usr/local/udp2raw
-mv udp2raw /usr/local/udp2raw/udp2raw
+    echo "Hysteria2 password"
+    read -p "Default(random): " hy2_password
+    hy2_password="${hy2_password:-$(openssl rand -hex 16)}"
 
-if [[ "${platform}" == "2" ]]; then
-    echo "------ Configuring the installation"
+    echo "Hysteria2 obfs (salamander) password"
+    read -p "Default(random): " hy2_obfs
+    hy2_obfs="${hy2_obfs:-$(openssl rand -hex 16)}"
+
+    echo "------ Generating Reality keys, UUID, short-id"
+    keys_out=$(/usr/local/bin/sing-box generate reality-keypair)
+    privkey=$(echo "$keys_out" | awk '/PrivateKey/ {print $2}')
+    pubkey=$(echo "$keys_out"  | awk '/PublicKey/  {print $2}')
+    uuid=$(/usr/local/bin/sing-box generate uuid)
+    shortid=$(openssl rand -hex 8)
+
+    echo "------ Generating self-signed TLS cert (for hysteria2)"
+    generate_self_signed_cert "${reality_dest}"
+
+    echo "------ Writing /etc/sing-box/config.json (server)"
+cat <<'CFG_EOF' > /etc/sing-box/config.json
+{
+  "log": { "level": "warn", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        { "uuid": "___UUID___", "flow": "xtls-rprx-vision" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "___REALITY_DEST___",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "___REALITY_DEST___",
+            "server_port": 443
+          },
+          "private_key": "___PRIVKEY___",
+          "short_id": ["", "___SHORTID___"]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 443,
+      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
+      "users": [ { "password": "___HY2_PASSWORD___" } ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/certs/cert.pem",
+        "key_path": "/etc/sing-box/certs/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+CFG_EOF
+    sed -i \
+        -e "s|___UUID___|${uuid}|g" \
+        -e "s|___REALITY_DEST___|${reality_dest}|g" \
+        -e "s|___PRIVKEY___|${privkey}|g" \
+        -e "s|___SHORTID___|${shortid}|g" \
+        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
+        -e "s|___HY2_PASSWORD___|${hy2_password}|g" \
+        /etc/sing-box/config.json
+
+else
+    # ====== CLIENT ======
     echo "Enter your Server IP"
     read -p ": " server_ip
     [[ -z "${server_ip}" ]] && exception "Server IP must be set!"
+
+    echo "Enter Hysteria2 password (from server install)"
+    read -p ": " hy2_password
+    [[ -z "${hy2_password}" ]] && exception "Hysteria2 password must be set!"
+
+    echo "Enter Hysteria2 obfs (salamander) password (from server install)"
+    read -p ": " hy2_obfs
+    [[ -z "${hy2_obfs}" ]] && exception "Hysteria2 obfs password must be set!"
+
+    echo "------ Writing /etc/sing-box/config.json (client)"
+cat <<'CFG_EOF' > /etc/sing-box/config.json
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "type": "tls",   "tag": "remote", "server": "1.1.1.1",   "detour": "hy2-out" },
+      { "type": "https", "tag": "local",  "server": "223.5.5.5" }
+    ],
+    "rules": [
+      { "rule_set": "geosite-cn",               "server": "local" },
+      { "rule_set": "geosite-category-ads-all", "action": "reject" }
+    ],
+    "strategy": "ipv4_only",
+    "final": "remote"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": ["172.19.0.1/30"],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-out",
+      "server": "___SERVER_IP___",
+      "server_port": 443,
+      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
+      "password": "___HY2_PASSWORD___",
+      "tls": { "enabled": true, "insecure": true }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "type": "remote", "tag": "geoip-cn", "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "hy2-out", "update_interval": "168h"
+      },
+      {
+        "type": "remote", "tag": "geosite-cn", "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
+        "download_detour": "hy2-out", "update_interval": "168h"
+      },
+      {
+        "type": "remote", "tag": "geosite-category-ads-all", "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+        "download_detour": "hy2-out", "update_interval": "168h"
+      }
+    ],
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "rule_set": "geosite-category-ads-all", "action": "reject" },
+      { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }
+    ],
+    "final": "hy2-out",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "remote"
+  },
+  "experimental": {
+    "cache_file": { "enabled": true, "path": "/var/lib/sing-box/cache.db" }
+  }
+}
+CFG_EOF
+    sed -i \
+        -e "s|___SERVER_IP___|${server_ip}|g" \
+        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
+        -e "s|___HY2_PASSWORD___|${hy2_password}|g" \
+        /etc/sing-box/config.json
 fi
 
-echo "Enter tinyfecVPN sub net"
-read -p "Default(10.22.22.0): " subnet
-[[ -z "${subnet}" ]] && subnet="10.22.22.0"
+chown -R sing-box:sing-box /etc/sing-box
 
-echo "Enter your fec setting"
-read -p "Default(20:10): " fec
-[[ -z "${fec}" ]] && fec="20:10"
-
-echo "Enter your udp2raw/tinyfecVPN password"
-read -p "Default(1234): " password
-[[ -z "${password}" ]] && password="1234"
-
-if [[ "${platform}" == "1" ]]; then
-    echo "Install xray + Reality on TCP/443? [Y/n]"
-    read -p "Default(Y): " install_reality
-    install_reality="${install_reality:-Y}"
-    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
-        echo "Reality serverName (a real TLS site to mimic)"
-        read -p "Default(www.cloudflare.com): " reality_dest
-        reality_dest="${reality_dest:-www.cloudflare.com}"
-    fi
-fi
-
-echo "------ Generating run scripts"
-mkdir -p /etc/tinyvpn /etc/udp2raw
-chgrp tinyvpn /etc/tinyvpn /etc/udp2raw
-chmod 750 /etc/tinyvpn /etc/udp2raw
-
-if [[ "${platform}" == "1" ]]; then
-cat > /etc/tinyvpn/tinyvpn.sh <<EOF
-#!/usr/bin/env bash
-exec /usr/local/tinyvpn/tinyvpn_amd64 -s -l0.0.0.0:14096 -f ${fec} --sub-net ${subnet} --tun-dev ${tun_dev} -k ${password}
-EOF
-cat > /etc/udp2raw/udp2raw.sh <<EOF
-#!/usr/bin/env bash
-exec /usr/local/udp2raw/udp2raw -s -l0.0.0.0:${udp2raw_port} -r127.0.0.1:14096 --raw-mode icmp --keep-rule -k ${password}
-EOF
-elif [[ "${platform}" == "2" ]]; then
-cat > /etc/tinyvpn/tinyvpn.sh <<EOF
-#!/usr/bin/env bash
-# Set up policy routing once tun100 appears. Re-runs harmlessly on tinyvpn restart
-# (rule/route adds error if already present, swallowed by '|| true').
-(
-    while ! ip link show ${tun_dev} >/dev/null 2>&1; do sleep 0.5; done
-    ip rule add fwmark 0x1/0x1 table 100 2>/dev/null || true
-    ip route add default dev ${tun_dev} table 100 2>/dev/null || true
-) &
-exec /usr/local/tinyvpn/tinyvpn_amd64 -c -r127.0.0.1:14096 -f ${fec} --sub-net ${subnet} --tun-dev ${tun_dev} --keep-reconnect -k ${password}
-EOF
-cat > /etc/udp2raw/udp2raw.sh <<EOF
-#!/usr/bin/env bash
-exec /usr/local/udp2raw/udp2raw -c -r${server_ip}:${udp2raw_port} -l127.0.0.1:14096 --raw-mode icmp --keep-rule -k ${password}
-EOF
-fi
-
-chmod 750 /etc/tinyvpn/tinyvpn.sh /etc/udp2raw/udp2raw.sh
-chgrp tinyvpn /etc/tinyvpn/tinyvpn.sh /etc/udp2raw/udp2raw.sh
-
-echo "------ Configuring services"
-if [[ "${platform}" == "1" ]]; then
-    # Server: tinyvpn must listen on :14096 before udp2raw forwards there.
-    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "" "CAP_NET_ADMIN"
-    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "tinyvpn.service" "CAP_NET_ADMIN CAP_NET_RAW"
-elif [[ "${platform}" == "2" ]]; then
-    # Client: udp2raw is egress; tinyvpn rides on top via 127.0.0.1:14096.
-    create_service "/etc/udp2raw/udp2raw.sh" "udp2raw" "" "CAP_NET_ADMIN CAP_NET_RAW"
-    create_service "/etc/tinyvpn/tinyvpn.sh" "tinyvpn" "udp2raw.service" "CAP_NET_ADMIN"
-fi
-
-echo "------ Enabling IP forwarding"
+echo "------ Enabling IP forwarding & UDP buffer tuning"
 enable_ip_forward
 
-if [[ "${platform}" == "1" ]]; then
-    echo "------ Disabling kernel ICMP echo replies"
-    enable_icmp_ignore
+echo "------ Checking kernel modules"
+modprobe tun 2>/dev/null || echo "[${yellow}Warn${plain}] tun module not available — sing-box tun inbound may fail"
 
-    echo "------ Configuring nftables"
-    nftables_configure_server "${subnet}"
-    systemctl enable nftables
-    systemctl restart nftables
+echo "------ Creating sing-box.service"
+create_service
 
-    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
-        install_xray_reality "${reality_dest}"
-    fi
-elif [[ "${platform}" == "2" ]]; then
-    echo "------ Configuring DNS over TLS"
-    configure_dns
+echo "------ Starting sing-box"
+systemctl restart sing-box.service
 
-    echo "------ Configuring nftables and chnroutes"
-    nftables_configure_client "${server_ip}"
-    create_chnroutes_cron
-    /etc/cron.weekly/chnroutes
-
-    systemctl enable nftables
-    systemctl restart nftables
-fi
-
-echo "------ Starting services"
-if [[ "${platform}" == "1" ]]; then
-    # Starting udp2raw pulls in tinyvpn via Requires=
-    systemctl start udp2raw.service
-elif [[ "${platform}" == "2" ]]; then
-    # Starting tinyvpn pulls in udp2raw via Requires=
-    systemctl start tinyvpn.service
+sleep 2
+if ! systemctl is-active --quiet sing-box; then
+    echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
+    exit 1
 fi
 
 clear
 if [[ "${platform}" == "1" ]]; then
     echo -e "Congratulations, ${green}Server${plain} install completed!"
-    echo -e "${red}Copy the info below as you need them in your client script!${plain}"
-    echo -e "Your Server IP                    : ${red} $(get_ip) ${plain}"
-    echo -e "Your tinyfecVPN sub net           : ${red} ${subnet} ${plain}"
-    echo -e "Your tinyfecVPN fec setting       : ${red} ${fec} ${plain}"
-    echo -e "Your udp2raw/tinyfecVPN password  : ${red} ${password} ${plain}"
-    if [[ "${install_reality}" =~ ^[Yy]$ ]]; then
-        echo
-        echo -e "${green}xray + Reality${plain} (configure your mobile app):"
-        echo -e "  Address       : ${red} $(get_ip) ${plain}"
-        echo -e "  Port          : ${red} 443 ${plain}"
-        echo -e "  UUID          : ${red} ${REALITY_UUID} ${plain}"
-        echo -e "  Flow          : ${red} xtls-rprx-vision ${plain}"
-        echo -e "  Public key    : ${red} ${REALITY_PUBKEY} ${plain}"
-        echo -e "  Short ID      : ${red} ${REALITY_SHORTID} ${plain}"
-        echo -e "  ServerName    : ${red} ${REALITY_SERVERNAME} ${plain}"
-        echo -e "  Fingerprint   : ${red} chrome ${plain}"
-    fi
+    echo
+    echo -e "${green}Reality (TCP/443)${plain} — for mobile / desktop clients (v2rayNG, etc.):"
+    echo -e "  Address      : ${red} $(get_ip) ${plain}"
+    echo -e "  Port         : ${red} 443 ${plain}"
+    echo -e "  UUID         : ${red} ${uuid} ${plain}"
+    echo -e "  Flow         : ${red} xtls-rprx-vision ${plain}"
+    echo -e "  Public key   : ${red} ${pubkey} ${plain}"
+    echo -e "  Short ID     : ${red} ${shortid} ${plain}"
+    echo -e "  ServerName   : ${red} ${reality_dest} ${plain}"
+    echo -e "  Fingerprint  : ${red} chrome ${plain}"
+    echo
+    echo -e "${green}Hysteria2 (UDP/443)${plain} — for the gateway client below:"
+    echo -e "  Address          : ${red} $(get_ip) ${plain}"
+    echo -e "  Port             : ${red} 443 ${plain}"
+    echo -e "  Password         : ${red} ${hy2_password} ${plain}"
+    echo -e "  Salamander obfs  : ${red} ${hy2_obfs} ${plain}"
+    echo -e "  TLS              : ${red} self-signed (client uses insecure) ${plain}"
+    echo
+    echo -e "${red}Save the values above — you'll need them on the client!${plain}"
 elif [[ "${platform}" == "2" ]]; then
     echo -e "Congratulations, ${green}Client${plain} install completed!"
+    echo -e "To use this machine as a gateway, set other devices' default gateway to its LAN IP."
+    echo
+    echo -e "Health checks:"
+    echo -e "  ${yellow}systemctl status sing-box${plain}"
+    echo -e "  ${yellow}journalctl -u sing-box -f${plain}"
+    echo -e "  ${yellow}curl https://ifconfig.me${plain}    # should return your server's IP"
 fi
