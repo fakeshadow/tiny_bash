@@ -2,30 +2,43 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# Single-binary VPN, all inside sing-box:
-#   Server: vless+reality on TCP/443 (mobile/desktop clients AND gateway).
-#   Client: tun inbound + vless+reality outbound, with auto-updating
-#           geoip-cn / geosite-cn rule sets (CN traffic exits direct).
+# Two-mode VPN install script.
 #
-# Why VLESS+Reality (TCP) and not hysteria2 (UDP/QUIC)?
-# As of 2026 the GFW extracts SNI from QUIC Initial packets and throttles
-# unrecognized flows within seconds; hysteria2 + Salamander has degraded
-# to ~68% bypass rate. VLESS+Reality imitates a real Cloudflare TLS
-# handshake at the byte level — currently the most GFW-resistant transport.
+# Server (mode 1): sing-box + vless+reality on TCP/443. Unchanged from the
+#                  prior revision because it has been working reliably.
+#
+# Client (mode 2): xray + dokodemo-door TPROXY inbound + vless+reality
+#                  outbound, as a transparent gateway for LAN devices.
+#
+# The client side follows Project X's official transparent-proxy guide,
+# verbatim where possible. Source references are inlined next to each
+# non-trivial config block:
+#   * https://xtls.github.io/en/document/level-2/transparent_proxy/transparent_proxy.html
+#   * https://xtls.github.io/en/document/level-2/tproxy.html
+#   * https://xtls.github.io/en/document/level-2/tproxy_ipv4_and_ipv6.html
+#   * https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision-REALITY
+#   * https://github.com/XTLS/Xray-install
 #
 # System Required: Ubuntu 26.04
 #
 # Important:
 # This script is for learning bash operations.
 
-# Pin a sing-box release. Bump as needed: https://github.com/SagerNet/sing-box/releases
+# --- pinned versions / URLs ------------------------------------------------
+
+# Server uses sing-box. Bump as needed: https://github.com/SagerNet/sing-box/releases
 singbox_version="1.13.11"
-# Server pulls direct from GitHub (overseas host → fast).
 singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
-# Client may sit behind the GFW where GitHub is slow/unreliable. ghfast.top
-# fronts GitHub releases. Swap to another mirror if this one rots —
-# alternatives: mirror.ghproxy.com, gh-proxy.com, github.moeyy.xyz, github.akams.cn.
 singbox_url_mirror="https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
+
+# Client uses xray. Installed via the project's official one-liner — same
+# tooling used by OpenWrt's luci-app-xray, OpenClash and others, so any
+# breakage shows up in those communities first.
+xray_install_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+
+# TPROXY listening port on the gateway (xray's dokodemo-door inbound).
+# Per xtls.github.io tproxy.html the default is 12345; no reason to change.
+tproxy_port=12345
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -43,14 +56,14 @@ get_ip(){
     echo ${IP}
 }
 
-ensure_service_user() {
+# --- server-only helpers (sing-box) ---------------------------------------
+
+ensure_singbox_user() {
     if ! id -u sing-box >/dev/null 2>&1; then
         useradd --system --no-create-home --shell /usr/sbin/nologin sing-box
     fi
 }
 
-# Try a single URL. Returns 0 on success, nonzero on download/extract failure
-# so the caller can fall through to another mirror.
 install_singbox_from() {
     local url="$1"
     local tmp
@@ -61,23 +74,14 @@ install_singbox_from() {
     install -m 755 "$tmp/sing-box" /usr/local/bin/sing-box
 }
 
-# Server: GitHub direct only. Client: mirror first, then GitHub as fallback.
 install_singbox() {
     local v="${singbox_version}"
-    local gh mirror
+    local gh
     gh=$(printf "${singbox_url_gh}" "$v" "$v")
-    mirror=$(printf "${singbox_url_mirror}" "$v" "$v")
-    if [[ "${platform}" == "1" ]]; then
-        install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
-    else
-        if ! install_singbox_from "$mirror"; then
-            echo "[${yellow}Warn${plain}] Mirror failed, falling back to GitHub direct..."
-            install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from mirror or GitHub"
-        fi
-    fi
+    install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
 }
 
-create_service() {
+create_singbox_service() {
 cat <<'SVC_EOF' > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box service
@@ -105,42 +109,219 @@ SVC_EOF
     systemctl enable sing-box.service
 }
 
-# IP forwarding for client gateway mode.
+# --- client-only helpers (xray + TPROXY) ----------------------------------
+
+# Use the project-maintained installer. It writes /usr/local/bin/xray and
+# /etc/systemd/system/xray.service with User=nobody + AmbientCapabilities
+# including CAP_NET_ADMIN already, which is what TPROXY needs — confirmed
+# by reading XTLS/Xray-install/install-release.sh.
+install_xray() {
+    bash -c "$(curl -L ${xray_install_url})" @ install || exception "xray install failed"
+}
+
+# Client config. Inbound block is the dokodemo-door TPROXY pattern from
+# xtls.github.io/en/document/level-2/tproxy.html . Outbound block is the
+# VLESS+Reality+Vision client template from
+# https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision-REALITY .
+# `streamSettings.sockopt.mark = 255` (0xff) makes xray's own outbound
+# traffic carry fwmark 0xff so the nftables rule below can RETURN it
+# without sending it back through TPROXY (loop avoidance).
+write_xray_client_config() {
+    local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5" spiderx="$6"
+cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "port": ___TPROXY_PORT___,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "sockopt": { "tproxy": "tproxy" }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "___SERVER_IP___",
+            "port": 443,
+            "users": [
+              {
+                "id": "___UUID___",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "serverName": "___SNI___",
+          "publicKey": "___PUBKEY___",
+          "shortId": "___SID___",
+          "spiderX": "___SPIDERX___"
+        },
+        "sockopt": { "mark": 255 }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "streamSettings": { "sockopt": { "mark": 255 } }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "network": "udp",
+        "port": 53,
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "network": "udp",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "network": "tcp",
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+}
+CFG_EOF
+    sed -i \
+        -e "s|___TPROXY_PORT___|${tproxy_port}|g" \
+        -e "s|___SERVER_IP___|${server_ip}|g" \
+        -e "s|___UUID___|${uuid}|g" \
+        -e "s|___PUBKEY___|${pubkey}|g" \
+        -e "s|___SID___|${sid}|g" \
+        -e "s|___SNI___|${sni}|g" \
+        -e "s|___SPIDERX___|${spiderx}|g" \
+        /usr/local/etc/xray/config.json
+}
+
+# Translation of the canonical iptables/nftables rules from
+# https://xtls.github.io/en/document/level-2/tproxy_ipv4_and_ipv6.html .
+# The hex mark 0x000000ff and 0x00000001 values come from that doc; they
+# are not magic numbers, they line up with the `mark: 255` set on xray's
+# outbounds and the fwmark used by the policy routing service below.
+write_tproxy_nftables() {
+cat <<'NFTEOF' > /etc/nftables.conf
+#!/usr/sbin/nft -f
+
+# Idempotent: only flush our own table — coexists with whatever else the
+# system may load (e.g. ufw / docker tables).
+add table inet xray
+flush table inet xray
+
+table inet xray {
+    chain prerouting {
+        type filter hook prerouting priority filter; policy accept;
+
+        # 1. Skip TPROXY for traffic that should never be proxied:
+        #    loopback, multicast, broadcast.
+        ip daddr { 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
+
+        # 2. LAN-internal TCP stays local. LAN-internal UDP also stays
+        #    local UNLESS it is DNS (so we can intercept DNS to the
+        #    gateway's IP if a client points there).
+        meta l4proto tcp ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
+        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } udp dport != 53 return
+
+        # 3. IPv6 link-local + unique-local mirror the v4 LAN exemptions.
+        ip6 daddr { ::1, fe80::/10 } return
+        meta l4proto tcp ip6 daddr fc00::/7 return
+        ip6 daddr fc00::/7 udp dport != 53 return
+
+        # 4. Loop avoidance: xray's own outbound packets (mark 0xff set
+        #    via streamSettings.sockopt.mark) bypass TPROXY.
+        meta mark 0x000000ff return
+
+        # 5. Everything else: TPROXY to xray, mark with 0x1 so the policy
+        #    routing rule below delivers the packet to the local socket.
+        meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip to 127.0.0.1:___TPROXY_PORT___ accept
+        meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip6 to [::1]:___TPROXY_PORT___ accept
+    }
+}
+NFTEOF
+    sed -i "s|___TPROXY_PORT___|${tproxy_port}|g" /etc/nftables.conf
+}
+
+# Policy routing: packets fwmark'd with 0x1 by the TPROXY rule are routed
+# to "lo" (delivered to local socket) via dedicated tables 100 (v4) and
+# 106 (v6). Numbers match xtls.github.io tproxy_ipv4_and_ipv6.html .
+write_tproxy_route_service() {
+cat <<'SVCEOF' > /etc/systemd/system/tproxy-route.service
+[Unit]
+Description=Policy routing for xray TPROXY (fwmark 0x1)
+After=network-pre.target nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Idempotent: ignore EEXIST on add, ignore ENOENT on del.
+ExecStart=-/sbin/ip -4 rule add fwmark 1 table 100
+ExecStart=-/sbin/ip -4 route add local default dev lo table 100
+ExecStart=-/sbin/ip -6 rule add fwmark 1 table 106
+ExecStart=-/sbin/ip -6 route add local default dev lo table 106
+ExecStop=-/sbin/ip -4 rule del fwmark 1 table 100
+ExecStop=-/sbin/ip -4 route flush table 100
+ExecStop=-/sbin/ip -6 rule del fwmark 1 table 106
+ExecStop=-/sbin/ip -6 route flush table 106
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload
+    systemctl enable tproxy-route.service
+}
+
+# --- common helpers --------------------------------------------------------
+
 enable_ip_forward() {
 cat <<'EOF' > /etc/sysctl.d/99-vpn.conf
 net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
 EOF
     sysctl --system >/dev/null
 }
 
-# Client-only: MSS clamp on forwarded TCP SYNs. LAN clients otherwise
-# negotiate MSS=1460 (Ethernet 1500 - TCP/IP 40), oversize segments hit tun0
-# at MTU 1380, and PMTUD recovery depends on ICMP "frag needed" reaching the
-# LAN sender — which is frequently dropped by consumer routers, mobile
-# stacks, or upstream firewalls. When PMTUD blackholes, large transfers
-# (TLS Certificate, file downloads) silently stall. Clamping at SYN time
-# bypasses PMTUD entirely.
-nftables_configure_client_mss() {
-cat <<'NFTEOF' > /etc/nftables.conf
-#!/usr/sbin/nft -f
-
-# Coexist with sing-box's auto_route managed table — only declare and flush
-# our own, never the global ruleset.
-add table inet vpngw_mss
-flush table inet vpngw_mss
-
-table inet vpngw_mss {
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        tcp flags syn tcp option maxseg size set rt mtu
-    }
-}
-NFTEOF
-}
-
-# All heredocs use quoted delimiters (<<'X') with ___PLACEHOLDER___ tokens
-# replaced via sed. Avoids bash mangling values that start with digits
-# (e.g. IPs like 199.x.x.x).
+# All heredocs in this script use quoted delimiters (<<'X') with
+# ___PLACEHOLDER___ tokens replaced via sed. Avoids bash mangling values
+# that start with digits (e.g. IPs like 199.x.x.x).
 
 if [[ $EUID -ne 0 ]]; then
     command -v sudo >/dev/null 2>&1 || exception "Run as root or install sudo."
@@ -156,18 +337,20 @@ fi
 
 echo "------ Install dependencies"
 apt update
-apt install -y curl ca-certificates openssl tar nftables
-
-ensure_service_user
-mkdir -p /etc/sing-box
-
-if ! command -v sing-box >/dev/null 2>&1; then
-    echo "------ Installing sing-box ${singbox_version}"
-    install_singbox
-fi
+# nftables is needed by the client (TPROXY rules); curl/openssl/tar are
+# common to both modes (singbox download / reality keys / xray installer).
+apt install -y curl ca-certificates openssl tar nftables iproute2
 
 if [[ "${platform}" == "1" ]]; then
-    # ====== SERVER ======
+    # ============================ SERVER =================================
+    ensure_singbox_user
+    mkdir -p /etc/sing-box
+
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo "------ Installing sing-box ${singbox_version}"
+        install_singbox
+    fi
+
     echo "Reality serverName (a real TLS site to mimic)"
     read -p "Default(www.cloudflare.com): " reality_dest
     reality_dest="${reality_dest:-www.cloudflare.com}"
@@ -219,10 +402,27 @@ CFG_EOF
         -e "s|___SHORTID___|${shortid}|g" \
         /etc/sing-box/config.json
 
+    chown -R sing-box:sing-box /etc/sing-box
+
+    echo "------ Enabling IP forwarding"
+    enable_ip_forward
+
+    echo "------ Creating sing-box.service"
+    create_singbox_service
+
+    echo "------ Starting sing-box"
+    systemctl restart sing-box.service
+
+    sleep 2
+    if ! systemctl is-active --quiet sing-box; then
+        echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
+        exit 1
+    fi
+
 else
-    # ====== CLIENT ======
-    # All five values below are printed by the server install script — they
-    # match the server's vless+reality inbound exactly, byte for byte.
+    # ============================ CLIENT =================================
+    # All five Reality values come from the server install printout —
+    # they must match the server's vless+reality inbound exactly.
     echo "Enter your Server IP"
     read -p ": " server_ip
     [[ -z "${server_ip}" ]] && exception "Server IP must be set!"
@@ -243,126 +443,44 @@ else
     read -p "Default(www.cloudflare.com): " reality_sni
     reality_sni="${reality_sni:-www.cloudflare.com}"
 
-    echo "------ Writing /etc/sing-box/config.json (client)"
-cat <<'CFG_EOF' > /etc/sing-box/config.json
-{
-  "log": { "level": "warn", "timestamp": true },
-  "dns": {
-    "servers": [
-      { "type": "tls",   "tag": "remote", "server": "1.1.1.1",   "detour": "reality-out" },
-      { "type": "https", "tag": "china",  "server": "223.5.5.5" },
-      { "type": "local", "tag": "system" }
-    ],
-    "rules": [
-      { "rule_set": "geosite-cn",               "server": "china" },
-      { "rule_set": "geosite-category-ads-all", "action": "reject" }
-    ],
-    "strategy": "ipv4_only",
-    "final": "remote"
-  },
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun-in",
-      "interface_name": "tun0",
-      "address": ["172.19.0.1/30"],
-      "mtu": 1380,
-      "auto_route": true,
-      "auto_redirect": true,
-      "strict_route": true,
-      "stack": "system"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "vless",
-      "tag": "reality-out",
-      "server": "___SERVER_IP___",
-      "server_port": 443,
-      "uuid": "___UUID___",
-      "flow": "xtls-rprx-vision",
-      "tls": {
-        "enabled": true,
-        "server_name": "___SNI___",
-        "utls": { "enabled": true, "fingerprint": "chrome" },
-        "reality": {
-          "enabled": true,
-          "public_key": "___PUBKEY___",
-          "short_id": "___SHORTID___"
-        }
-      }
-    },
-    { "type": "direct", "tag": "direct" }
-  ],
-  "route": {
-    "rule_set": [
-      {
-        "type": "remote", "tag": "geoip-cn", "format": "binary",
-        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-        "download_detour": "direct", "update_interval": "168h"
-      },
-      {
-        "type": "remote", "tag": "geosite-cn", "format": "binary",
-        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
-        "download_detour": "direct", "update_interval": "168h"
-      },
-      {
-        "type": "remote", "tag": "geosite-category-ads-all", "format": "binary",
-        "url": "https://ghfast.top/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-        "download_detour": "direct", "update_interval": "168h"
-      }
-    ],
-    "rules": [
-      { "action": "sniff" },
-      { "protocol": "dns", "action": "hijack-dns" },
-      { "ip_is_private": true, "outbound": "direct" },
-      { "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32"], "outbound": "direct" },
-      { "rule_set": "geosite-category-ads-all", "action": "reject" },
-      { "rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct" }
-    ],
-    "final": "reality-out",
-    "auto_detect_interface": true,
-    "default_domain_resolver": "system"
-  },
-  "experimental": {
-    "cache_file": { "enabled": true, "path": "/var/lib/sing-box/cache.db" }
-  }
-}
-CFG_EOF
-    sed -i \
-        -e "s|___SERVER_IP___|${server_ip}|g" \
-        -e "s|___UUID___|${reality_uuid}|g" \
-        -e "s|___PUBKEY___|${reality_pubkey}|g" \
-        -e "s|___SHORTID___|${reality_shortid}|g" \
-        -e "s|___SNI___|${reality_sni}|g" \
-        /etc/sing-box/config.json
-fi
+    # spiderX is optional. If your server's reality 'dest' is an IP-only
+    # endpoint, it can be empty; otherwise something like '/dns-query/'
+    # is fine. See Xray-examples/VLESS-TCP-XTLS-Vision-REALITY/config_client.jsonc .
+    echo "Enter Reality spiderX (optional, default empty)"
+    read -p "Default(empty): " reality_spiderx
 
-chown -R sing-box:sing-box /etc/sing-box
+    if ! command -v xray >/dev/null 2>&1; then
+        echo "------ Installing xray (XTLS/Xray-install)"
+        install_xray
+    fi
 
-echo "------ Enabling IP forwarding & UDP buffer tuning"
-enable_ip_forward
+    echo "------ Writing /usr/local/etc/xray/config.json (client)"
+    write_xray_client_config "${server_ip}" "${reality_uuid}" "${reality_pubkey}" "${reality_shortid}" "${reality_sni}" "${reality_spiderx}"
 
-if [[ "${platform}" == "2" ]]; then
-    echo "------ Configuring nftables MSS clamp (forwarded TCP through the tunnel)"
-    nftables_configure_client_mss
+    echo "------ Writing /etc/nftables.conf (TPROXY rules)"
+    write_tproxy_nftables
+
+    echo "------ Writing tproxy-route.service (policy routing for fwmark 0x1)"
+    write_tproxy_route_service
+
+    echo "------ Enabling IP forwarding"
+    enable_ip_forward
+
+    echo "------ Starting nftables / tproxy-route / xray"
     systemctl enable nftables 2>/dev/null || true
     systemctl restart nftables
-fi
+    systemctl restart tproxy-route.service
+    systemctl restart xray.service
 
-echo "------ Checking kernel modules"
-modprobe tun 2>/dev/null || echo "[${yellow}Warn${plain}] tun module not available — sing-box tun inbound may fail"
-
-echo "------ Creating sing-box.service"
-create_service
-
-echo "------ Starting sing-box"
-systemctl restart sing-box.service
-
-sleep 2
-if ! systemctl is-active --quiet sing-box; then
-    echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
-    exit 1
+    sleep 2
+    if ! systemctl is-active --quiet xray; then
+        echo -e "[${red}Error${plain}] xray failed to start. Check: ${yellow}journalctl -u xray -n 50${plain}"
+        exit 1
+    fi
+    if ! systemctl is-active --quiet tproxy-route; then
+        echo -e "[${red}Error${plain}] tproxy-route failed. Check: ${yellow}journalctl -u tproxy-route -n 50${plain}"
+        exit 1
+    fi
 fi
 
 clear
@@ -380,12 +498,16 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
     echo -e "${red}Save the values above — the client install will ask for all of them.${plain}"
-elif [[ "${platform}" == "2" ]]; then
+else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
-    echo -e "To use this machine as a gateway, set other devices' default gateway to its LAN IP."
+    echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
     echo
     echo -e "Health checks:"
-    echo -e "  ${yellow}systemctl status sing-box${plain}"
-    echo -e "  ${yellow}journalctl -u sing-box -f${plain}"
-    echo -e "  ${yellow}curl https://ifconfig.me${plain}    # should return your server's IP"
+    echo -e "  ${yellow}systemctl status xray nftables tproxy-route${plain}"
+    echo -e "  ${yellow}journalctl -u xray -f${plain}"
+    echo -e "  ${yellow}nft list table inet xray${plain}                # TPROXY rules"
+    echo -e "  ${yellow}ip rule  | grep -i fwmark${plain}               # 'fwmark 0x1 lookup 100'"
+    echo -e "  ${yellow}ip route show table 100${plain}                 # 'local default dev lo'"
+    echo -e "  From a LAN device pointed at this gateway:"
+    echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP"
 fi
