@@ -122,6 +122,29 @@ EOF
     sysctl --system >/dev/null
 }
 
+# Client-only: MSS clamp on forwarded TCP SYNs. Without this, LAN clients
+# negotiate MSS=1460 (Ethernet 1500 - TCP/IP 40), their TLS Certificate
+# segments don't survive QUIC encapsulation through the tun, and PMTUD
+# typically gets blackholed → handshakes hang. Clamping to the tun route
+# MTU forces both ends to use small enough segments from the start.
+nftables_configure_client_mss() {
+cat <<'NFTEOF' > /etc/nftables.conf
+#!/usr/sbin/nft -f
+
+# Coexist with sing-box's auto_route managed table — only declare and flush
+# our own, never the global ruleset.
+add table inet vpngw_mss
+flush table inet vpngw_mss
+
+table inet vpngw_mss {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+NFTEOF
+}
+
 # All heredocs use quoted delimiters (<<'X') with ___PLACEHOLDER___ tokens
 # replaced via sed. Avoids bash mangling values that start with digits
 # (e.g. IPs like 199.x.x.x).
@@ -140,7 +163,7 @@ fi
 
 echo "------ Install dependencies"
 apt update
-apt install -y curl ca-certificates openssl tar
+apt install -y curl ca-certificates openssl tar nftables
 
 ensure_service_user
 mkdir -p /etc/sing-box
@@ -266,7 +289,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
       "tag": "tun-in",
       "interface_name": "tun0",
       "address": ["172.19.0.1/30"],
-      "mtu": 1400,
+      "mtu": 1380,
       "auto_route": true,
       "strict_route": true,
       "stack": "system"
@@ -330,6 +353,13 @@ chown -R sing-box:sing-box /etc/sing-box
 
 echo "------ Enabling IP forwarding & UDP buffer tuning"
 enable_ip_forward
+
+if [[ "${platform}" == "2" ]]; then
+    echo "------ Configuring nftables MSS clamp (forwarded TCP through the tunnel)"
+    nftables_configure_client_mss
+    systemctl enable nftables 2>/dev/null || true
+    systemctl restart nftables
+fi
 
 echo "------ Checking kernel modules"
 modprobe tun 2>/dev/null || echo "[${yellow}Warn${plain}] tun module not available — sing-box tun inbound may fail"
