@@ -572,6 +572,28 @@ apt install -y curl ca-certificates openssl tar nftables iproute2 unzip cron
 
 if [[ "${platform}" == "1" ]]; then
     # ============================ SERVER =================================
+
+    # Pre-flight 1/3: idempotency. Re-running the install regenerates a
+    # fresh Reality keypair + UUID and overwrites /usr/local/etc/xray/
+    # config.json — which silently invalidates ALL existing clients. Make
+    # this a deliberate choice rather than a foot-gun.
+    if [[ -f /usr/local/etc/xray/config.json ]]; then
+        echo -e "[${yellow}Warn${plain}] /usr/local/etc/xray/config.json already exists."
+        echo -e "       Re-running will generate NEW Reality keys + UUID and OVERWRITE it."
+        echo -e "       All currently-connected clients will break until reconfigured."
+        read -p "Continue and overwrite? [y/N]: " confirm
+        [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]] && exception "Aborted by user. To inspect the existing config: ${yellow}cat /usr/local/etc/xray/config.json${plain}"
+    fi
+
+    # Pre-flight 2/3: another listener on TCP/443 will make xray fail to
+    # bind. Catch it now with a clear message instead of letting xray die
+    # silently after we've written the config.
+    if ss -tln 2>/dev/null | awk '$4 ~ /:443$/' | grep -q .; then
+        echo -e "[${red}Error${plain}] TCP/443 is already in use by another process:"
+        ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/' || true
+        exception "Stop the conflicting service (e.g. nginx/caddy/apache) before re-running."
+    fi
+
     if ! command -v xray >/dev/null 2>&1; then
         echo "------ Installing xray ${xray_version} (GitHub direct)"
         install_xray
@@ -598,8 +620,23 @@ if [[ "${platform}" == "1" ]]; then
     echo "------ Writing /usr/local/etc/xray/config.json (server)"
     write_xray_server_config "${uuid}" "${privkey}" "${shortid}" "${reality_dest}"
 
-    echo "------ Enabling IP forwarding"
-    enable_ip_forward
+    # Pre-flight 3/3: validate config schema with xray itself before
+    # touching the live service. Catches JSON typos / schema errors with
+    # a clear xray-side error message instead of letting systemd churn.
+    # NOTE: xray v26 dropped the standalone `xray test` subcommand;
+    # `-test` is now a flag on the `run` subcommand.
+    echo "------ Validating xray config"
+    if ! /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json; then
+        exception "xray config validation failed (see error above). Bug in tiny.sh or hand-edit?"
+    fi
+
+    # If UFW is installed AND active, idempotently allow TCP/443. Don't
+    # touch UFW if it's inactive (don't enable it for the user) — but
+    # if they enabled it, they need 443 open for the proxy to work.
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "------ UFW is active — allowing TCP/443"
+        ufw allow 443/tcp >/dev/null
+    fi
 
     echo "------ Creating xray.service"
     create_xray_service
@@ -706,6 +743,11 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
     echo -e "${red}Save the values above — the client install will ask for all of them.${plain}"
+    echo
+    echo -e "${yellow}Reachability check (do this FIRST before configuring clients):${plain}"
+    echo -e "  From any external machine: ${yellow}curl -v --max-time 5 https://$(get_ip):443${plain}"
+    echo -e "  Expect a TLS handshake (the cert will look like ${reality_dest}'s — that's Reality working)."
+    echo -e "  If it times out, your cloud provider's security group / external firewall is blocking 443."
 else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
