@@ -323,10 +323,6 @@ cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
       "tag": "direct",
       "protocol": "freedom",
       "streamSettings": { "sockopt": { "mark": 255 } }
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole"
     }
   ],
   "routing": {
@@ -345,12 +341,7 @@ cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
       },
       {
         "type": "field",
-        "network": "udp",
-        "outboundTag": "block"
-      },
-      {
-        "type": "field",
-        "network": "tcp",
+        "network": "tcp,udp",
         "outboundTag": "proxy"
       }
     ]
