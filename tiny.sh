@@ -14,6 +14,26 @@ export PATH
 #                  outbound with packetEncoding=xudp, as a transparent
 #                  gateway for LAN devices.
 #
+# Flow choice (asymmetric, by design):
+#   * Server inbound:  "xtls-rprx-vision"           (only accepted value)
+#   * Client outbound: "xtls-rprx-vision-udp443"    (this gateway only)
+#
+# The default Vision flow rejects UDP/443 client-side because QUIC over
+# Vision is double-TLS (QUIC's own TLS 1.3 inside Vision's outer TLS 1.3)
+# — wasteful when you can disable QUIC at the LAN client and let it fall
+# back to TCP. We can't do that on a transparent gateway (every LAN
+# device would need the toggle), so the gateway opts into the "-udp443"
+# variant: it sets allowUDP443=true locally and strips the suffix
+# (requestAddons.Flow = requestAddons.Flow[:16]) BEFORE the value hits
+# the wire. The server therefore only ever sees "xtls-rprx-vision" and
+# its inbound flow validator (which only accepts that exact string)
+# stays happy. Sources:
+#   * outbound.go (rejection + suffix strip): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/outbound/outbound.go
+#   * inbound.go (server-side flow validator): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/inbound/inbound.go
+#
+# Non-443 UDP (Discord voice, NTP, game servers, etc.) is not affected
+# by either guard — the rejection check only fires when port==443.
+#
 # Both sides follow Project X's official references verbatim where
 # possible. Source URLs are inlined next to each non-trivial config block:
 #   * https://xtls.github.io/en/document/level-2/transparent_proxy/transparent_proxy.html
@@ -300,7 +320,7 @@ cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
               {
                 "id": "___UUID___",
                 "encryption": "none",
-                "flow": "xtls-rprx-vision"
+                "flow": "xtls-rprx-vision-udp443"
               }
             ]
           }
@@ -539,6 +559,32 @@ EOF
     sysctl --system >/dev/null
 }
 
+# BBR + fq is the loss-tolerant alternative to CUBIC, and it matters a
+# lot in this setup: the Reality tunnel is a single TCP connection
+# carrying ALL proxied traffic, so every segment loss head-of-line
+# stalls the whole tunnel for ~1 RTT. CN↔overseas paths routinely run
+# 0.3–1% loss at peak — CUBIC's throughput collapses to a few Mbps in
+# that range, BBR holds ~20+ Mbps. fq qdisc gives BBR proper packet
+# pacing (recommended pairing per the BBR authors). Both endpoints of
+# the Reality tunnel benefit, so it runs on server and client alike.
+# Linux ≥ 4.9 ships BBR; Ubuntu 24.04+ has it auto-loadable.
+enable_bbr() {
+cat <<'EOF' > /etc/sysctl.d/99-bbr.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl --system >/dev/null
+    # If the kernel doesn't have BBR available, the sysctl set silently
+    # falls back to whatever was active. Verify so the user isn't quietly
+    # left on CUBIC, expecting BBR's loss-tolerance behavior.
+    local active
+    active=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$active" != "bbr" ]]; then
+        echo -e "[${yellow}Warn${plain}] tcp_congestion_control is '${active}', not 'bbr' — kernel may lack BBR."
+        echo -e "[${yellow}Warn${plain}] Tunnel will work but throughput will sag under packet loss."
+    fi
+}
+
 # All heredocs in this script use quoted delimiters (<<'X') with
 # ___PLACEHOLDER___ tokens replaced via sed. Avoids bash mangling values
 # that start with digits (e.g. IPs like 199.x.x.x).
@@ -629,6 +675,9 @@ if [[ "${platform}" == "1" ]]; then
         ufw allow 443/tcp >/dev/null
     fi
 
+    echo "------ Enabling BBR congestion control"
+    enable_bbr
+
     echo "------ Creating xray.service"
     create_xray_service
 
@@ -693,6 +742,9 @@ else
 
     echo "------ Enabling IP forwarding"
     enable_ip_forward
+
+    echo "------ Enabling BBR congestion control"
+    enable_bbr
 
     echo "------ Starting nftables / tproxy-route / xray"
     systemctl enable nftables 2>/dev/null || true
