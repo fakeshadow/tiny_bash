@@ -4,11 +4,15 @@ export PATH
 
 # Two-mode VPN install script.
 #
-# Server (mode 1): sing-box + vless+reality on TCP/443. Unchanged from the
-#                  prior revision because it has been working reliably.
+# Server (mode 1): sing-box with two inbounds:
+#                    * vless+reality        on TCP/443  (primary, max stealth)
+#                    * hysteria2+salamander on UDP/443  (UDP fallback,
+#                                                        with port hopping)
 #
 # Client (mode 2): xray + dokodemo-door TPROXY inbound + vless+reality
 #                  outbound, as a transparent gateway for LAN devices.
+#                  Client uses Reality TCP only; the server's hy2 inbound
+#                  is for external mobile/desktop clients that prefer UDP.
 #
 # Flow choice (asymmetric, by design):
 #   * Server inbound:  "xtls-rprx-vision"           (only accepted value)
@@ -74,6 +78,16 @@ xray_url_templates=(
 # Per xtls.github.io tproxy.html the default is 12345; no reason to change.
 tproxy_port=12345
 
+# Hysteria2 port-hopping range (server side). The hy2 socket binds only
+# to UDP/443; an nftables NAT redirect maps this whole UDP range onto
+# UDP/443 so clients can rotate ports to defeat per-port ISP throttling
+# (China Telecom 163 backbone caps unclassified UDP flows at ~1 Mbps
+# after sustained use of a single port). Range is wide on purpose —
+# narrow ranges are themselves a fingerprint.
+# Source: https://v2.hysteria.network/docs/advanced/Port-Hopping/
+hy2_port_hop_start=20000
+hy2_port_hop_end=50000
+
 # CN-route bypass: weekly-refreshed list of CN-bound CIDRs loaded into an
 # nftables set. Packets to those destinations RETURN early (skip TPROXY)
 # and reach the local network direct via the kernel's normal forwarding
@@ -131,6 +145,42 @@ install_singbox() {
     local gh
     gh=$(printf "${singbox_url_gh}" "$v" "$v")
     install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
+}
+
+# Self-signed cert for hysteria2's TLS layer. Hy2 doesn't lean on the
+# cert for identity (auth happens via password+salamander); the cert
+# just provides the QUIC TLS 1.3 handshake bytes. Client uses
+# tls.insecure=true. Salamander obfs runs OUTSIDE this TLS — it scrambles
+# the QUIC packets themselves, so the GFW's QUIC SNI extractor sees noise
+# and can't classify the flow as QUIC at all.
+generate_self_signed_cert() {
+    local cn="$1"
+    mkdir -p /etc/sing-box/certs
+    openssl ecparam -genkey -name prime256v1 -out /etc/sing-box/certs/key.pem 2>/dev/null
+    openssl req -new -x509 -days 3650 -key /etc/sing-box/certs/key.pem \
+        -out /etc/sing-box/certs/cert.pem -subj "/CN=${cn}" 2>/dev/null
+    chown -R sing-box:sing-box /etc/sing-box/certs
+    chmod 600 /etc/sing-box/certs/key.pem
+}
+
+# Hy2 port hopping: server hy2 binds one UDP/443 socket; the kernel NAT
+# redirect maps the whole hy2_port_hop_start..end range onto UDP/443
+# before sing-box sees the packet. Source IP is preserved (REDIRECT, not
+# DNAT-to-remote), so per-user accounting / GeoIP still works.
+# Source: https://v2.hysteria.network/docs/advanced/Port-Hopping/
+nftables_configure_server_hy2_hop() {
+cat <<NFTEOF > /etc/nftables.conf
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet hy2_hop {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        udp dport ${hy2_port_hop_start}-${hy2_port_hop_end} redirect to :443
+    }
+}
+NFTEOF
+    chmod +x /etc/nftables.conf
 }
 
 create_singbox_service() {
@@ -562,6 +612,20 @@ EOF
     fi
 }
 
+# Hysteria2 over QUIC needs large UDP socket buffers — kernel defaults
+# (~200KB) cap throughput at ~50 Mbps regardless of link speed because
+# the QUIC fast-recovery window can't grow large enough. 16MB is the
+# value the hy2 docs recommend for 100Mbps+ links. Server-only: the
+# client side here uses TCP (Reality), not UDP.
+# Source: https://v2.hysteria.network/docs/advanced/Performance-Optimization/
+tune_udp_buffers() {
+cat <<'EOF' > /etc/sysctl.d/99-udp-buffers.conf
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+EOF
+    sysctl --system >/dev/null
+}
+
 # All heredocs in this script use quoted delimiters (<<'X') with
 # ___PLACEHOLDER___ tokens replaced via sed. Avoids bash mangling values
 # that start with digits (e.g. IPs like 199.x.x.x).
@@ -598,12 +662,23 @@ if [[ "${platform}" == "1" ]]; then
     read -p "Default(www.cloudflare.com): " reality_dest
     reality_dest="${reality_dest:-www.cloudflare.com}"
 
+    echo "Hysteria2 password"
+    read -p "Default(random): " hy2_password
+    hy2_password="${hy2_password:-$(openssl rand -hex 16)}"
+
+    echo "Hysteria2 obfs (salamander) password"
+    read -p "Default(random): " hy2_obfs
+    hy2_obfs="${hy2_obfs:-$(openssl rand -hex 16)}"
+
     echo "------ Generating Reality keys, UUID, short-id"
     keys_out=$(/usr/local/bin/sing-box generate reality-keypair)
     privkey=$(echo "$keys_out" | awk '/PrivateKey/ {print $2}')
     pubkey=$(echo "$keys_out"  | awk '/PublicKey/  {print $2}')
     uuid=$(/usr/local/bin/sing-box generate uuid)
     shortid=$(openssl rand -hex 8)
+
+    echo "------ Generating self-signed TLS cert (for hysteria2)"
+    generate_self_signed_cert "${reality_dest}"
 
     echo "------ Writing /etc/sing-box/config.json (server)"
 cat <<'CFG_EOF' > /etc/sing-box/config.json
@@ -631,6 +706,19 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
           "short_id": ["", "___SHORTID___"]
         }
       }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 443,
+      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
+      "users": [ { "password": "___HY2_PASSWORD___" } ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/certs/cert.pem",
+        "key_path": "/etc/sing-box/certs/key.pem"
+      }
     }
   ],
   "outbounds": [
@@ -643,6 +731,8 @@ CFG_EOF
         -e "s|___REALITY_DEST___|${reality_dest}|g" \
         -e "s|___PRIVKEY___|${privkey}|g" \
         -e "s|___SHORTID___|${shortid}|g" \
+        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
+        -e "s|___HY2_PASSWORD___|${hy2_password}|g" \
         /etc/sing-box/config.json
 
     chown -R sing-box:sing-box /etc/sing-box
@@ -650,8 +740,18 @@ CFG_EOF
     echo "------ Enabling IP forwarding"
     enable_ip_forward
 
+    echo "------ Tuning UDP socket buffers (for hysteria2)"
+    tune_udp_buffers
+
     echo "------ Enabling BBR congestion control"
     enable_bbr
+
+    echo "------ Writing /etc/nftables.conf (hy2 port-hop ${hy2_port_hop_start}-${hy2_port_hop_end} -> 443)"
+    nftables_configure_server_hy2_hop
+
+    echo "------ Starting nftables"
+    systemctl enable nftables 2>/dev/null || true
+    systemctl restart nftables
 
     echo "------ Creating sing-box.service"
     create_singbox_service
@@ -662,6 +762,10 @@ CFG_EOF
     sleep 2
     if ! systemctl is-active --quiet sing-box; then
         echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
+        exit 1
+    fi
+    if ! systemctl is-active --quiet nftables; then
+        echo -e "[${red}Error${plain}] nftables failed to start. Check: ${yellow}journalctl -u nftables -n 50${plain}"
         exit 1
     fi
 
@@ -759,7 +863,20 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  ServerName   : ${red} ${reality_dest} ${plain}"
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
+    echo -e "${green}Hysteria2 (UDP/443, port-hopping ${hy2_port_hop_start}-${hy2_port_hop_end})${plain} — UDP fallback for QUIC-loving clients:"
+    echo -e "  Address          : ${red} $(get_ip) ${plain}"
+    echo -e "  Port (single)    : ${red} 443 ${plain}"
+    echo -e "  Port-hop range   : ${red} ${hy2_port_hop_start}-${hy2_port_hop_end} ${plain}  (client format: ${yellow}server:443,${hy2_port_hop_start}-${hy2_port_hop_end}${plain})"
+    echo -e "  Password         : ${red} ${hy2_password} ${plain}"
+    echo -e "  Salamander obfs  : ${red} ${hy2_obfs} ${plain}"
+    echo -e "  TLS              : ${red} self-signed (client uses insecure=true) ${plain}"
+    echo
     echo -e "${red}Save the values above — the client install will ask for all of them.${plain}"
+    echo
+    echo -e "${yellow}Cloud provider security group / external firewall — open these:${plain}"
+    echo -e "  ${yellow}TCP/443${plain}                     (Reality)"
+    echo -e "  ${yellow}UDP/443${plain}                     (hy2 primary)"
+    echo -e "  ${yellow}UDP/${hy2_port_hop_start}-${hy2_port_hop_end}${plain}             (hy2 port-hop range)"
 else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
