@@ -2,17 +2,13 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# Two-mode VPN install script. Both sides use xray.
+# Two-mode VPN install script.
 #
-# Server (mode 1): xray + vless+reality+vision inbound on TCP/443.
-#                  Auto-accepts XUDP packet encoding from clients, so
-#                  UDP traffic (Discord voice, QUIC, games) tunnels
-#                  through the same Reality TCP connection — no extra
-#                  port needed.
+# Server (mode 1): sing-box + vless+reality on TCP/443. Unchanged from the
+#                  prior revision because it has been working reliably.
 #
 # Client (mode 2): xray + dokodemo-door TPROXY inbound + vless+reality
-#                  outbound with packetEncoding=xudp, as a transparent
-#                  gateway for LAN devices.
+#                  outbound, as a transparent gateway for LAN devices.
 #
 # Flow choice (asymmetric, by design):
 #   * Server inbound:  "xtls-rprx-vision"           (only accepted value)
@@ -34,8 +30,9 @@ export PATH
 # Non-443 UDP (Discord voice, NTP, game servers, etc.) is not affected
 # by either guard — the rejection check only fires when port==443.
 #
-# Both sides follow Project X's official references verbatim where
-# possible. Source URLs are inlined next to each non-trivial config block:
+# The client side follows Project X's official transparent-proxy guide,
+# verbatim where possible. Source references are inlined next to each
+# non-trivial config block:
 #   * https://xtls.github.io/en/document/level-2/transparent_proxy/transparent_proxy.html
 #   * https://xtls.github.io/en/document/level-2/tproxy.html
 #   * https://xtls.github.io/en/document/level-2/tproxy_ipv4_and_ipv6.html
@@ -49,35 +46,28 @@ export PATH
 
 # --- pinned versions / URLs ------------------------------------------------
 
-# xray runs on BOTH sides (server + client).
-# Bump as needed: https://github.com/XTLS/Xray-core/releases
+# Server uses sing-box. Bump as needed: https://github.com/SagerNet/sing-box/releases
+singbox_version="1.13.11"
+singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
+
+# Client uses xray. Bump as needed: https://github.com/XTLS/Xray-core/releases
 xray_version="26.3.27"
-
-# Two %s slots in every URL below: version (without leading "v") and
-# arch tag ("64" or "arm64-v8a").
-
-# Server-side: use GitHub direct. The server is, by definition, a
-# machine with clean upstream connectivity (it's the egress point that
-# the client tunnels through). CN mirrors there would just add latency
-# and failure modes for no benefit.
-xray_url_gh="https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-
-# Client-side: ordered list of URL templates, tried in order, first
-# success wins. The client typically lives in mainland China where
-# GitHub direct is unreliable.
+# Ordered list of URL templates for the xray-core release zip. The script
+# tries each in order and uses the first one that responds. Two %s slots:
+# the version (without leading "v"), and the arch tag ("64" or "arm64-v8a").
 #
-# No single CN-friendly mirror is reliably up — what works rotates over
-# time. If you find a better mirror, prepend it to this list. If they
-# all die, the manual escape hatch is documented in install_xray() below.
-# Each entry below was probed at script-write time: HTTP 200 + a real
-# ZIP header (50 4b 03 04) on a range-GET, not just a HEAD ping.
-# GitHub direct is kept as a last-resort fallback.
+# No single CN-friendly mirror is reliably up — what works rotates over time.
+# If you find a better mirror, prepend it to this list. If they all die,
+# the manual escape hatch is documented in install_xray() below.
+# Each entry below was probed at script-write time: HTTP 200 + a real ZIP
+# header byte (50 4b 03 04) on a range-GET, not just a HEAD ping. If you
+# find a better mirror (or one of these dies), prepend/swap freely.
 xray_url_templates=(
     "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
     "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
     "https://kkgithub.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
     "https://gh.ddlc.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-    "${xray_url_gh}"
+    "https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
 )
 
 # TPROXY listening port on the gateway (xray's dokodemo-door inbound).
@@ -118,7 +108,60 @@ get_ip(){
     echo ${IP}
 }
 
-# --- xray helpers (shared by server + client) -----------------------------
+# --- server-only helpers (sing-box) ---------------------------------------
+
+ensure_singbox_user() {
+    if ! id -u sing-box >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin sing-box
+    fi
+}
+
+install_singbox_from() {
+    local url="$1"
+    local tmp
+    tmp=$(mktemp -d)
+    trap "rm -rf '$tmp'" RETURN
+    curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp/sb.tar.gz" || return 1
+    tar -xzf "$tmp/sb.tar.gz" -C "$tmp" --strip-components=1 || return 1
+    install -m 755 "$tmp/sing-box" /usr/local/bin/sing-box
+}
+
+install_singbox() {
+    local v="${singbox_version}"
+    local gh
+    gh=$(printf "${singbox_url_gh}" "$v" "$v")
+    install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
+}
+
+create_singbox_service() {
+cat <<'SVC_EOF' > /etc/systemd/system/sing-box.service
+[Unit]
+Description=sing-box service
+Wants=network-online.target
+After=network-online.target nss-lookup.target
+
+[Service]
+User=sing-box
+Group=sing-box
+ExecStart=/usr/local/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+    mkdir -p /var/lib/sing-box
+    chown -R sing-box:sing-box /var/lib/sing-box /etc/sing-box
+    systemctl daemon-reload
+    systemctl enable sing-box.service
+}
+
+# --- client-only helpers (xray + TPROXY) ----------------------------------
 
 # Try a single URL. Returns 0 on success, nonzero on download/extract
 # failure so the caller can fall through to another mirror.
@@ -135,22 +178,19 @@ install_xray_from() {
     mkdir -p /usr/local/etc/xray
 }
 
-# install_xray <use_mirrors>
-#   use_mirrors = "1" → try the CN-friendly mirror chain (client side)
-#   anything else      → GitHub direct only (server side)
+# Tries each entry of xray_url_templates in order. First success wins.
 #
-# Manual escape hatch — if all configured URLs fail in your network:
+# Manual escape hatch — if all mirrors fail in your network:
 #   1. From any machine with working GitHub access (e.g. your overseas
-#      server), download and copy the zip to the target machine:
+#      server), download and copy the zip to the gateway:
 #        wget https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-linux-64.zip
-#        scp Xray-linux-64.zip target:/tmp/
-#   2. On the target: pre-place the binary so this script's `command -v
+#        scp Xray-linux-64.zip gateway:/tmp/
+#   2. On the gateway: pre-place the binary so this script's `command -v
 #      xray` check short-circuits the download:
 #        sudo unzip /tmp/Xray-linux-64.zip -d /tmp/xray
 #        sudo install -m 755 /tmp/xray/xray /usr/local/bin/xray
 #   3. Re-run sudo ./tiny.sh — install_xray will be skipped entirely.
 install_xray() {
-    local use_mirrors="${1:-0}"
     local v="${xray_version}"
     local arch
     case "$(uname -m)" in
@@ -158,25 +198,17 @@ install_xray() {
         aarch64|arm64) arch="arm64-v8a" ;;
         *) exception "Unsupported architecture for xray: $(uname -m)" ;;
     esac
-
-    local templates
-    if [[ "$use_mirrors" == "1" ]]; then
-        templates=("${xray_url_templates[@]}")
-    else
-        templates=("$xray_url_gh")
-    fi
-
     local tmpl url
-    for tmpl in "${templates[@]}"; do
+    for tmpl in "${xray_url_templates[@]}"; do
         url=$(printf "${tmpl}" "$v" "$arch")
         echo "------ Trying: ${url}"
         if install_xray_from "$url"; then
             echo "[${green}OK${plain}] xray ${v} installed."
             return 0
         fi
-        echo "[${yellow}Warn${plain}] Failed; trying next URL..."
+        echo "[${yellow}Warn${plain}] Failed; trying next mirror..."
     done
-    exception "All xray download URLs failed. See manual escape hatch in install_xray() comment in tiny.sh."
+    exception "All xray mirrors failed. See manual escape hatch in install_xray() comment in tiny.sh."
 }
 
 # Replicates the systemd unit that XTLS/Xray-install/install-release.sh
@@ -206,61 +238,6 @@ WantedBy=multi-user.target
 XRAYSVC_EOF
     systemctl daemon-reload
     systemctl enable xray.service
-}
-
-# Server config. VLESS+Reality+Vision inbound is the canonical template
-# from https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision-REALITY .
-# Server-side has no explicit packetEncoding field — xray's VLESS inbound
-# auto-accepts whatever encoding (xudp, packetaddr, none) the client
-# negotiates per-connection.
-#
-# realitySettings.dest is the upstream HTTPS site whose handshake xray
-# proxies through to clients that fail Reality verification (probe-
-# resistance / GFW active-probe defense). serverNames must include the
-# SNI the client uses. shortIds includes "" so clients without a short
-# ID also auth.
-write_xray_server_config() {
-    local uuid="$1" privkey="$2" shortid="$3" reality_dest="$4"
-cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "tag": "reality-in",
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "___UUID___", "flow": "xtls-rprx-vision" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "___REALITY_DEST___:443",
-          "xver": 0,
-          "serverNames": ["___REALITY_DEST___"],
-          "privateKey": "___PRIVKEY___",
-          "shortIds": ["", "___SHORTID___"]
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    { "tag": "direct", "protocol": "freedom" }
-  ]
-}
-CFG_EOF
-    sed -i \
-        -e "s|___UUID___|${uuid}|g" \
-        -e "s|___PRIVKEY___|${privkey}|g" \
-        -e "s|___SHORTID___|${shortid}|g" \
-        -e "s|___REALITY_DEST___|${reality_dest}|g" \
-        /usr/local/etc/xray/config.json
 }
 
 # Client config. Inbound block is the dokodemo-door TPROXY pattern from
@@ -603,37 +580,18 @@ fi
 
 echo "------ Install dependencies"
 apt update
-# nftables is needed by the client (TPROXY rules); curl/unzip/openssl
-# are common to both modes (xray .zip installer + Reality short_id gen).
+# nftables is needed by the client (TPROXY rules); curl/openssl/tar are
+# common to both modes (singbox download / reality keys / xray installer).
 apt install -y curl ca-certificates openssl tar nftables iproute2 unzip cron
 
 if [[ "${platform}" == "1" ]]; then
     # ============================ SERVER =================================
+    ensure_singbox_user
+    mkdir -p /etc/sing-box
 
-    # Pre-flight 1/3: idempotency. Re-running the install regenerates a
-    # fresh Reality keypair + UUID and overwrites /usr/local/etc/xray/
-    # config.json — which silently invalidates ALL existing clients. Make
-    # this a deliberate choice rather than a foot-gun.
-    if [[ -f /usr/local/etc/xray/config.json ]]; then
-        echo -e "[${yellow}Warn${plain}] /usr/local/etc/xray/config.json already exists."
-        echo -e "       Re-running will generate NEW Reality keys + UUID and OVERWRITE it."
-        echo -e "       All currently-connected clients will break until reconfigured."
-        read -p "Continue and overwrite? [y/N]: " confirm
-        [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]] && exception "Aborted by user. To inspect the existing config: ${yellow}cat /usr/local/etc/xray/config.json${plain}"
-    fi
-
-    # Pre-flight 2/3: another listener on TCP/443 will make xray fail to
-    # bind. Catch it now with a clear message instead of letting xray die
-    # silently after we've written the config.
-    if ss -tln 2>/dev/null | awk '$4 ~ /:443$/' | grep -q .; then
-        echo -e "[${red}Error${plain}] TCP/443 is already in use by another process:"
-        ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/' || true
-        exception "Stop the conflicting service (e.g. nginx/caddy/apache) before re-running."
-    fi
-
-    if ! command -v xray >/dev/null 2>&1; then
-        echo "------ Installing xray ${xray_version} (GitHub direct)"
-        install_xray
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo "------ Installing sing-box ${singbox_version}"
+        install_singbox
     fi
 
     echo "Reality serverName (a real TLS site to mimic)"
@@ -641,52 +599,69 @@ if [[ "${platform}" == "1" ]]; then
     reality_dest="${reality_dest:-www.cloudflare.com}"
 
     echo "------ Generating Reality keys, UUID, short-id"
-    # `xray x25519` output format varies across versions:
-    #   "Private key:" / "Password:"   (older)
-    #   "PrivateKey:"  / "Password:"   (some versions)
-    #   "Private key:" / "Public key:" (newest)
-    # The awk pattern below handles all three by matching on the key
-    # role (private vs password/public) regardless of casing/spacing.
-    keys_out=$(/usr/local/bin/xray x25519)
-    privkey=$(echo "$keys_out" | awk 'tolower($0) ~ /private[ ]?key/ {print $NF}')
-    pubkey=$(echo  "$keys_out" | awk 'tolower($0) ~ /password|public[ ]?key/ {print $NF}')
-    uuid=$(/usr/local/bin/xray uuid)
+    keys_out=$(/usr/local/bin/sing-box generate reality-keypair)
+    privkey=$(echo "$keys_out" | awk '/PrivateKey/ {print $2}')
+    pubkey=$(echo "$keys_out"  | awk '/PublicKey/  {print $2}')
+    uuid=$(/usr/local/bin/sing-box generate uuid)
     shortid=$(openssl rand -hex 8)
-    [[ -z "${privkey}" || -z "${pubkey}" || -z "${uuid}" ]] && exception "Failed to generate Reality keys / UUID via xray. Check 'xray x25519' output format."
 
-    echo "------ Writing /usr/local/etc/xray/config.json (server)"
-    write_xray_server_config "${uuid}" "${privkey}" "${shortid}" "${reality_dest}"
+    echo "------ Writing /etc/sing-box/config.json (server)"
+cat <<'CFG_EOF' > /etc/sing-box/config.json
+{
+  "log": { "level": "warn", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        { "uuid": "___UUID___", "flow": "xtls-rprx-vision" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "___REALITY_DEST___",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "___REALITY_DEST___",
+            "server_port": 443
+          },
+          "private_key": "___PRIVKEY___",
+          "short_id": ["", "___SHORTID___"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+CFG_EOF
+    sed -i \
+        -e "s|___UUID___|${uuid}|g" \
+        -e "s|___REALITY_DEST___|${reality_dest}|g" \
+        -e "s|___PRIVKEY___|${privkey}|g" \
+        -e "s|___SHORTID___|${shortid}|g" \
+        /etc/sing-box/config.json
 
-    # Pre-flight 3/3: validate config schema with xray itself before
-    # touching the live service. Catches JSON typos / schema errors with
-    # a clear xray-side error message instead of letting systemd churn.
-    # NOTE: xray v26 dropped the standalone `xray test` subcommand;
-    # `-test` is now a flag on the `run` subcommand.
-    echo "------ Validating xray config"
-    if ! /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json; then
-        exception "xray config validation failed (see error above). Bug in tiny.sh or hand-edit?"
-    fi
+    chown -R sing-box:sing-box /etc/sing-box
 
-    # If UFW is installed AND active, idempotently allow TCP/443. Don't
-    # touch UFW if it's inactive (don't enable it for the user) — but
-    # if they enabled it, they need 443 open for the proxy to work.
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo "------ UFW is active — allowing TCP/443"
-        ufw allow 443/tcp >/dev/null
-    fi
+    echo "------ Enabling IP forwarding"
+    enable_ip_forward
 
     echo "------ Enabling BBR congestion control"
     enable_bbr
 
-    echo "------ Creating xray.service"
-    create_xray_service
+    echo "------ Creating sing-box.service"
+    create_singbox_service
 
-    echo "------ Starting xray"
-    systemctl restart xray.service
+    echo "------ Starting sing-box"
+    systemctl restart sing-box.service
 
     sleep 2
-    if ! systemctl is-active --quiet xray; then
-        echo -e "[${red}Error${plain}] xray failed to start. Check: ${yellow}journalctl -u xray -n 50${plain}"
+    if ! systemctl is-active --quiet sing-box; then
+        echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
         exit 1
     fi
 
@@ -721,8 +696,7 @@ else
     read -p "Default(empty): " reality_spiderx
 
     if ! command -v xray >/dev/null 2>&1; then
-        echo "------ Installing xray ${xray_version} (CN mirror chain)"
-        install_xray 1
+        install_xray
     fi
 
     echo "------ Writing /usr/local/etc/xray/config.json (client)"
@@ -786,11 +760,6 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
     echo -e "${red}Save the values above — the client install will ask for all of them.${plain}"
-    echo
-    echo -e "${yellow}Reachability check (do this FIRST before configuring clients):${plain}"
-    echo -e "  From any external machine: ${yellow}curl -v --max-time 5 https://$(get_ip):443${plain}"
-    echo -e "  Expect a TLS handshake (the cert will look like ${reality_dest}'s — that's Reality working)."
-    echo -e "  If it times out, your cloud provider's security group / external firewall is blocking 443."
 else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
