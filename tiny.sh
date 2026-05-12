@@ -269,36 +269,74 @@ SVC_EOF
 # (auto_detect_interface, the equivalent of xray's `sockopt.mark = 0xff`
 # for loop avoidance).
 #
-# DNS architecture (split-horizon):
-#   * proxy_dns  — DoH to dns.google, queries tunneled via `detour: "proxy"`,
-#                  used for everything not classified as CN. `domain_resolver:
-#                  "cn_dns"` is required because the server field is a
-#                  hostname (sing-box must resolve it once at startup).
+# DNS architecture (split-horizon + fakeip):
+#   * proxy_dns  — DoH to dns.google via `detour: "proxy"`. Handles non-A/AAAA
+#                  queries (TXT/MX/etc.) and is the `final` server.
+#                  `domain_resolver: "cn_dns"` is required because the server
+#                  field is a hostname (sing-box resolves it once at startup).
 #   * cn_dns     — type "local": delegates to the gateway OS's resolver
-#                  (systemd-resolved on Ubuntu 26.04, which already reflects
-#                  whatever DNS came from the WAN's DHCP or static config).
-#                  Used to resolve CN sites so they get region-local CDN
-#                  edge IPs. Tracks the upstream automatically, no IP to
-#                  hard-code. Loop-safe under dns_mode=hijack because the
-#                  local server uses systemd-resolved's D-Bus interface,
-#                  not UDP/53, so the platform DNS hijack rule doesn't
-#                  catch it.
-#   * default_domain_resolver: cn_dns — fallback resolver for route rules
-#                  that need to materialize a hostname (and for bootstrapping
-#                  proxy_dns itself; cn_dns returns clean answers for
-#                  apolitical domains like dns.google).
+#                  (systemd-resolved on Ubuntu 26.04). Used to resolve CN sites
+#                  so they get region-local CDN edges. Loop-safe under TUN DNS
+#                  hijack because "local" uses systemd-resolved's D-Bus interface
+#                  on Linux, not UDP/53.
+#   * fakeip     — synthetic IP allocator (198.18.0.0/15 / fc00::/18). Returns
+#                  a deterministic fake IP for every proxied A/AAAA query. When
+#                  the LAN client connects to that fake IP, sing-box's router
+#                  detects the fakeip-range destination and rewrites
+#                  metadata.Destination.Fqdn back to the original hostname
+#                  BEFORE the outbound dial — so the overseas server receives
+#                  "connect to <hostname>" and resolves it from its own clean
+#                  DNS. This is the sing-box equivalent of xray's
+#                  `sniffing.destOverride + routeOnly:false` (see master branch).
 #
-# dns_mode is left at the default "hijack" — the TUN inbound installs
-# platform-level DNS hijacking that funnels LAN clients' DNS queries into
-# the sing-box DNS module above, instead of letting them leak directly to
-# whatever DNS the LAN client was hard-coded with.
+# Why fakeip and not plain `sniff`: sing-box 1.13.0 removed the legacy
+# `sniff_override_destination` inbound field, and the route-rule `sniff` action
+# does not expose an equivalent option in JSON. Sniff still populates
+# `metadata.Domain` for routing decisions, but does NOT rewrite the outbound
+# destination. Without fakeip the gateway forwards the LAN-resolved (often
+# GFW-poisoned) IP to the server, which then times out dialing it. Sources:
+#   * route.go fakeip reverse-mapping:
+#       https://github.com/SagerNet/sing-box/blob/v1.13.11/route/route.go
+#   * RuleActionSniff — OverrideDestination is marked Deprecated and no longer
+#     reachable from JSON config:
+#       https://github.com/SagerNet/sing-box/blob/v1.13.11/route/rule/rule_action.go
+#   * fakeip server schema:
+#       https://sing-box.sagernet.org/configuration/dns/server/fakeip/
+#
+# Hard requirement: LAN clients MUST use this gateway as their DNS server,
+# otherwise they bypass fakeip entirely. Force it via DHCP option 6 on the
+# LAN router (advertise this gateway's LAN IP as the only DNS server). LAN
+# devices that ignore DHCP DNS (Chrome auto-DoH, iOS/Android Private DNS
+# pointed at an external DoT endpoint, hard-coded resolvers like Chromecast
+# / smart-TV sticks, etc.) will still leak — block known DoH/DoT endpoints
+# with additional route rules if you have such devices.
+#
+# Upstream tracking — both constraints above (needing fakeip at all, AND
+# needing to force gateway-as-DNS for every LAN device) would disappear if
+# sing-box restored any mechanism to set metadata.Destination from the
+# sniffed domain. Two plausible paths that would lift it:
+#   * Expose the (currently-deprecated, hidden-from-JSON) `OverrideDestination`
+#     field of the route-rule `sniff` action — this is what the master
+#     branch's xray client already does via `sniffing.routeOnly: false`.
+#   * Add a new `route-options` flag (e.g. `use_sniffed_domain: true`) that
+#     copies metadata.Domain into metadata.Destination.Fqdn post-sniff.
+#
+# Upstream has so far rejected requests to restore the legacy
+# `sniff_override_destination` field — see SagerNet/sing-box issues
+# #3982, #3951, #4011, all closed "completed" with fakeip pointed at as
+# the canonical workaround. Re-check those (and any successor) on each
+# sing-box bump; if either mechanism above lands, the fakeip server,
+# the A/AAAA→fakeip DNS rule, AND the LAN-must-use-gateway-DNS
+# requirement can all be dropped.
+#
+# CN sites are exempted from fakeip via the rule_set=cnsite DNS rule
+# (matched FIRST, before the A/AAAA→fakeip catch-all), so they keep real
+# CN-edge IPs and bypass the proxy via the cnip/cnsite route rules.
+#
+# dns_mode is the default ("hijack"): the route rule
+# `{ "protocol": "dns", "action": "hijack-dns" }` catches UDP/53 packets from
+# LAN clients (to any upstream) and routes them into the DNS module above.
 # Source: https://sing-box.sagernet.org/configuration/inbound/tun/#dns_mode
-#
-# Sniff action extracts the hostname from TLS SNI / HTTP Host / QUIC
-# ClientHello and uses it as the destination address for the outbound
-# dial. This is the sing-box equivalent of xray's `sniffing.routeOnly =
-# false` (LAN-resolved IPs are region-local edges, forwarding the
-# *hostname* lets the overseas server re-resolve to a geo-correct edge).
 #
 # rule_sets are fetched remotely from MetaCubeX/meta-rules-dat (the most
 # actively-maintained sing-box rule_set repo), refreshed every 24h via
@@ -336,16 +374,20 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
       {
         "tag": "cn_dns",
         "type": "local"
+      },
+      {
+        "tag": "fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
       }
     ],
     "rules": [
-      {
-        "rule_set": "cnsite",
-        "server": "cn_dns"
-      }
+      { "rule_set": "cnsite", "server": "cn_dns" },
+      { "query_type": ["A", "AAAA"], "server": "fakeip" }
     ],
     "final": "proxy_dns",
-    "disable_cache": true
+    "independent_cache": true
   },
   "inbounds": [
     {
@@ -730,13 +772,21 @@ else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
     echo
+    echo -e "${red}CRITICAL${plain}: LAN clients MUST use this gateway as their ${red}DNS server${plain} too"
+    echo -e "(DHCP option 6 → gateway LAN IP). The fakeip mechanism that lets the"
+    echo -e "overseas server resolve hostnames itself only fires for DNS queries that"
+    echo -e "hit this sing-box instance — devices that use external DoH/DoT (Chrome"
+    echo -e "auto-DoH, iOS Private Relay, Android Private DNS) will bypass it and"
+    echo -e "fail with i/o-timeout on GFW-poisoned or geo-restricted destinations."
+    echo
     echo -e "Health checks:"
     echo -e "  ${yellow}systemctl status sing-box${plain}"
     echo -e "  ${yellow}journalctl -u sing-box -f${plain}"
     echo -e "  ${yellow}ip link show singtun0${plain}                   # TUN device (auto_route)"
     echo -e "  ${yellow}ip route show table all | grep singtun0${plain} # routes auto-installed by sing-box"
     echo -e "  ${yellow}ls -lh /var/lib/sing-box${plain}                # cached rule_sets (cnsite/cnip/gfw/cngames)"
-    echo -e "  From a LAN device pointed at this gateway:"
+    echo -e "  From a LAN device pointed at this gateway (gateway + DNS):"
     echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP"
     echo -e "  ${yellow}curl https://www.baidu.com -I${plain}           # should bypass proxy (CN-route)"
+    echo -e "  ${yellow}dig @<gateway-LAN-ip> www.google.com${plain}    # should answer in fakeip range (198.18/15)"
 fi
