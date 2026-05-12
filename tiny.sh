@@ -9,16 +9,27 @@ export PATH
 #                    * hysteria2+salamander on UDP/443  (UDP fallback,
 #                                                        with port hopping)
 #
-# Client (mode 2): sing-box with a TUN inbound + vless+reality outbound,
-#                  as a transparent gateway for LAN devices.
-#                  Routing/CN-bypass live inside sing-box (route rules +
-#                  local geoip-cn rule_set), no nftables required.
-#                  Client uses Reality TCP only; the server's hy2 inbound
-#                  is for external mobile/desktop clients that prefer UDP.
+# Client (mode 2): sing-box with a TUN inbound and TWO proxy outbounds —
+#                  vless+reality on TCP (tag "proxy_tcp") and
+#                  hysteria2+salamander on UDP (tag "proxy_udp", with
+#                  port hopping 20000-50000 → :443) — as a transparent
+#                  gateway for LAN devices. Route rules split by network:
+#                  TCP → vless, UDP → hy2, CN-bound → direct. Network
+#                  restrictions ("network":"tcp"/"udp") are declared on
+#                  each proxy outbound so a misrouted packet errors loudly
+#                  instead of silently re-enabling xudp.
+#
+# Why split TCP/UDP onto two transports: vless+Vision is a single TCP
+# tunnel; piling UDP on it via xudp (a) suffers TCP head-of-line blocking
+# under loss, and (b) leaves the per-port UDP-throttling problem
+# unsolved since the wire packets are still TCP/443. hy2 over QUIC has
+# independent streams and native port-hopping, so it's the right
+# transport for UDP. With UDP off the Reality tunnel, vless carries only
+# TCP — narrower scope, less HoL damage from any one stall.
 #
 # Flow choice (same string on both sides — sing-box does the right thing):
 #   * Server inbound:  "xtls-rprx-vision"
-#   * Client outbound: "xtls-rprx-vision"
+#   * Client outbound: "xtls-rprx-vision"  (TCP only; UDP goes via hy2)
 #
 # In xray, plain "xtls-rprx-vision" rejects UDP/443 client-side because
 # QUIC-over-Vision is double-TLS, so xray defines a separate
@@ -33,12 +44,14 @@ export PATH
 #   * nekoray issue #898 (cross-impl equivalence note): https://github.com/MatsuriDayo/nekoray/issues/898
 #   * xray Vision (for contrast): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/outbound/outbound.go
 #
-# Client architecture references:
+# Client architecture references (high-level — see the comment block above
+# write_singbox_client_config for the per-section details with sources):
 #   * TUN inbound:        https://sing-box.sagernet.org/configuration/inbound/tun/
 #   * Route + rule_set:   https://sing-box.sagernet.org/configuration/route/
 #   * 1.12+ rule actions: https://sing-box.sagernet.org/migration/
 #   * VLESS+Reality out:  https://sing-box.sagernet.org/configuration/outbound/vless/
-#   * geoip-cn rule_set:  https://github.com/SagerNet/sing-geoip
+#   * Hysteria2 out:      https://sing-box.sagernet.org/configuration/outbound/hysteria2/
+#   * Rule sets source:   https://github.com/MetaCubeX/meta-rules-dat
 #
 # System Required: Ubuntu 26.04
 #
@@ -51,8 +64,10 @@ export PATH
 singbox_version="1.13.11"
 
 # Server-side download URL. The server is overseas and has direct GitHub
-# access; no mirror chain needed here. Two %s slots: version, version.
-singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
+# access; no mirror chain needed here. Three %s slots: version (URL path),
+# version (tarball name), arch ("amd64" or "arm64") — same format as the
+# client mirror chain below so the URL strings stay aligned.
+singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
 
 # Client-side mirror chain. Client is typically inside CN where direct
 # GitHub is rate-limited / RST'd, so we try CN-friendly proxies first
@@ -122,8 +137,14 @@ install_singbox_from() {
 
 install_singbox() {
     local v="${singbox_version}"
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) exception "Unsupported architecture for sing-box: $(uname -m)" ;;
+    esac
     local gh
-    gh=$(printf "${singbox_url_gh}" "$v" "$v")
+    gh=$(printf "${singbox_url_gh}" "$v" "$v" "$arch")
     install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
 }
 
@@ -270,8 +291,8 @@ SVC_EOF
 # for loop avoidance).
 #
 # DNS architecture (split-horizon + fakeip):
-#   * proxy_dns  — DoH to dns.google via `detour: "proxy"`. Handles non-A/AAAA
-#                  queries (TXT/MX/etc.) and is the `final` server.
+#   * proxy_dns  — DoH to dns.google via `detour: "proxy_tcp"`. Handles
+#                  non-A/AAAA queries (TXT/MX/etc.) and is the `final` server.
 #                  `domain_resolver: "cn_dns"` is required because the server
 #                  field is a hostname (sing-box resolves it once at startup).
 #   * cn_dns     — type "local": delegates to the gateway OS's resolver
@@ -331,20 +352,36 @@ SVC_EOF
 #
 # CN sites are exempted from fakeip via the rule_set=cnsite DNS rule
 # (matched FIRST, before the A/AAAA→fakeip catch-all), so they keep real
-# CN-edge IPs and bypass the proxy via the cnip/cnsite route rules.
+# CN-edge IPs and match the cnsite/cnip route rules → direct outbound.
+# cngames domains aren't in the cnsite DNS rule (they're not CN sites,
+# they're non-CN games tagged for CN-direct routing), so they DO get
+# fakeip → reverse-mapped to hostname → matched by the cngames route
+# rule → direct. That works but is one round-trip wasteful; adding
+# cngames to the DNS rules would skip the indirection.
 #
-# dns_mode is the default ("hijack"): the route rule
-# `{ "protocol": "dns", "action": "hijack-dns" }` catches UDP/53 packets from
-# LAN clients (to any upstream) and routes them into the DNS module above.
-# Source: https://sing-box.sagernet.org/configuration/inbound/tun/#dns_mode
+# DNS hijack on LAN: the route rule
+# `{ "protocol": "dns", "action": "hijack-dns" }` catches UDP/53 packets
+# from LAN clients (regardless of upstream the client aimed at) and feeds
+# them into the DNS module above. Without it, LAN clients' DNS queries
+# leak past sing-box and hit (often poisoned) upstream resolvers
+# directly. The legacy TUN-inbound `dns_mode` field was removed in
+# sing-box 1.13, so this route rule is now the only path to DNS hijack.
+# Source: https://sing-box.sagernet.org/configuration/route/rule_action/#hijack-dns
 #
 # rule_sets are fetched remotely from MetaCubeX/meta-rules-dat (the most
 # actively-maintained sing-box rule_set repo), refreshed every 24h via
 # `update_interval`. Initial fetch happens after sing-box starts, so on
-# first boot all traffic falls through to `final: "proxy"` until those
-# downloads complete (~30s). `download_detour: "proxy"` routes the fetches
-# through the tunnel — important because raw.githubusercontent.com isn't
-# reachable from inside the GFW.
+# first boot all traffic falls through to `final: "proxy_tcp"` until those
+# downloads complete (~30s). `download_detour: "proxy_tcp"` routes the
+# fetches through the TCP tunnel — important because
+# raw.githubusercontent.com isn't reachable from inside the GFW.
+#
+# Earlier revisions of this client config carried a `gfw` rule_set
+# (geosite blocked-from-CN list). It's been removed: with the new
+# `final: "proxy_tcp"` and `network:udp → proxy_udp` catch-all rules at
+# the bottom of route.rules, "everything not classified as CN goes via
+# the proxy" — so an explicit gfw match is redundant. One less rule_set
+# to fetch / cache / re-download.
 #
 # Refs:
 #   * TUN options:        https://sing-box.sagernet.org/configuration/inbound/tun/
@@ -352,13 +389,18 @@ SVC_EOF
 #   * DNS local server:   https://sing-box.sagernet.org/configuration/dns/server/local/
 #   * DNS https server:   https://sing-box.sagernet.org/configuration/dns/server/https/
 #   * VLESS+Reality out:  https://sing-box.sagernet.org/configuration/outbound/vless/
+#   * Hysteria2 out:      https://sing-box.sagernet.org/configuration/outbound/hysteria2/
 #   * Rule sets source:   https://github.com/MetaCubeX/meta-rules-dat
 #
 # Note on `flow`: sing-box's "xtls-rprx-vision" has no UDP/443 guard, so
 # it works as the gateway's outbound flow without the xray-specific
-# "-udp443" suffix. See header notes (top of this file) for sources.
+# "-udp443" suffix. In our split, UDP doesn't reach vless at all
+# (route rule + `"network":"tcp"` restriction on the outbound), so the
+# 443-UDP guard would be moot here regardless. See header notes (top of
+# this file) for sources.
 write_singbox_client_config() {
-    local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5"
+    local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5" \
+          hy2_pw="$6" hy2_obfs="$7"
 cat <<'CFG_EOF' > /etc/sing-box/config.json
 {
   "log": { "level": "warn", "timestamp": true },
@@ -369,7 +411,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
         "type": "https",
         "server": "dns.google",
         "domain_resolver": "cn_dns",
-        "detour": "proxy"
+        "detour": "proxy_tcp"
       },
       {
         "tag": "cn_dns",
@@ -405,12 +447,12 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
   "outbounds": [
     {
       "type": "vless",
-      "tag": "proxy",
+      "tag": "proxy_tcp",
+      "network": "tcp",
       "server": "___SERVER_IP___",
       "server_port": 443,
       "uuid": "___UUID___",
       "flow": "xtls-rprx-vision",
-      "packet_encoding": "xudp",
       "tls": {
         "enabled": true,
         "server_name": "___SNI___",
@@ -421,6 +463,17 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
           "short_id": "___SID___"
         }
       }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "proxy_udp",
+      "network": "udp",
+      "server": "___SERVER_IP___",
+      "server_port": 443,
+      "server_ports": ["___HY2_HOP_START___:___HY2_HOP_END___"],
+      "password": "___HY2_PW___",
+      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
+      "tls": { "enabled": true, "insecure": true }
     },
     { "type": "direct", "tag": "direct" }
   ],
@@ -434,7 +487,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
         "format": "binary",
         "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/cn.srs",
         "update_interval": "24h",
-        "download_detour": "proxy"
+        "download_detour": "proxy_tcp"
       },
       {
         "tag": "cnip",
@@ -442,7 +495,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
         "format": "binary",
         "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geoip/cn.srs",
         "update_interval": "24h",
-        "download_detour": "proxy"
+        "download_detour": "proxy_tcp"
       },
       {
         "tag": "cngames",
@@ -450,15 +503,7 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
         "format": "binary",
         "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/category-games-!cn@cn.srs",
         "update_interval": "24h",
-        "download_detour": "proxy"
-      },
-      {
-        "tag": "gfw",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/gfw.srs",
-        "update_interval": "24h",
-        "download_detour": "proxy"
+        "download_detour": "proxy_tcp"
       }
     ],
     "rules": [
@@ -466,12 +511,12 @@ cat <<'CFG_EOF' > /etc/sing-box/config.json
       { "protocol": "dns", "action": "hijack-dns" },
       { "network": "icmp", "outbound": "direct" },
       { "ip_is_private": true, "outbound": "direct" },
-      { "rule_set": "gfw", "outbound": "proxy" },
       { "rule_set": "cnsite", "outbound": "direct" },
       { "rule_set": "cnip", "outbound": "direct" },
-      { "rule_set": "cngames", "outbound": "direct" }
+      { "rule_set": "cngames", "outbound": "direct" },
+      { "network": "udp", "outbound": "proxy_udp" }
     ],
-    "final": "proxy"
+    "final": "proxy_tcp"
   }
 }
 CFG_EOF
@@ -481,6 +526,10 @@ CFG_EOF
         -e "s|___PUBKEY___|${pubkey}|g" \
         -e "s|___SID___|${sid}|g" \
         -e "s|___SNI___|${sni}|g" \
+        -e "s|___HY2_PW___|${hy2_pw}|g" \
+        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
+        -e "s|___HY2_HOP_START___|${hy2_port_hop_start}|g" \
+        -e "s|___HY2_HOP_END___|${hy2_port_hop_end}|g" \
         /etc/sing-box/config.json
 }
 
@@ -496,12 +545,14 @@ EOF
 
 # BBR + fq is the loss-tolerant alternative to CUBIC, and it matters a
 # lot in this setup: the Reality tunnel is a single TCP connection
-# carrying ALL proxied traffic, so every segment loss head-of-line
-# stalls the whole tunnel for ~1 RTT. CN↔overseas paths routinely run
-# 0.3–1% loss at peak — CUBIC's throughput collapses to a few Mbps in
-# that range, BBR holds ~20+ Mbps. fq qdisc gives BBR proper packet
-# pacing (recommended pairing per the BBR authors). Both endpoints of
-# the Reality tunnel benefit, so it runs on server and client alike.
+# carrying ALL proxied TCP traffic, so every segment loss head-of-line
+# stalls every multiplexed stream on it for ~1 RTT. CN↔overseas paths
+# routinely run 0.3–1% loss at peak — CUBIC's throughput collapses to a
+# few Mbps in that range, BBR holds ~20+ Mbps. fq qdisc gives BBR proper
+# packet pacing (recommended pairing per the BBR authors). Both endpoints
+# of the Reality tunnel benefit, so it runs on server and client alike.
+# (hy2/QUIC is unaffected — QUIC has its own congestion control and
+# independent streams, so HoL doesn't apply across UDP traffic.)
 # Linux ≥ 4.9 ships BBR; Ubuntu 24.04+ has it auto-loadable.
 enable_bbr() {
 cat <<'EOF' > /etc/sysctl.d/99-bbr.conf
@@ -523,8 +574,9 @@ EOF
 # Hysteria2 over QUIC needs large UDP socket buffers — kernel defaults
 # (~200KB) cap throughput at ~50 Mbps regardless of link speed because
 # the QUIC fast-recovery window can't grow large enough. 16MB is the
-# value the hy2 docs recommend for 100Mbps+ links. Server-only: the
-# client side here uses TCP (Reality), not UDP.
+# value the hy2 docs recommend for 100Mbps+ links. Applied on BOTH sides
+# of the tunnel now: server runs the hy2 inbound, client runs the hy2
+# outbound (proxy_udp) for all proxied UDP traffic.
 # Source: https://v2.hysteria.network/docs/advanced/Performance-Optimization/
 tune_udp_buffers() {
 cat <<'EOF' > /etc/sysctl.d/99-udp-buffers.conf
@@ -534,9 +586,15 @@ EOF
     sysctl --system >/dev/null
 }
 
-# All heredocs in this script use quoted delimiters (<<'X') with
-# ___PLACEHOLDER___ tokens replaced via sed. Avoids bash mangling values
-# that start with digits (e.g. IPs like 199.x.x.x).
+# The JSON-config heredocs in this script use quoted delimiters
+# (<<'CFG_EOF') with ___PLACEHOLDER___ tokens replaced via sed afterward.
+# This avoids bash interpolation mangling values that start with digits
+# (e.g. IPs like 199.x.x.x), contain $ / `, or other shell metacharacters
+# (passwords, base64 strings). The one exception is
+# nftables_configure_server_hy2_hop's heredoc, which is unquoted
+# (<<NFTEOF) so bash interpolates the hy2_port_hop_start/end variables
+# directly — its only substituted values are integers, so the safety
+# concern doesn't apply.
 
 if [[ $EUID -ne 0 ]]; then
     command -v sudo >/dev/null 2>&1 || exception "Run as root or install sudo."
@@ -705,6 +763,14 @@ else
     # Note: xray had an extra "spiderX" parameter here; sing-box's reality
     # outbound does not expose it (the path is fixed inside sing-vmess).
 
+    echo "Enter Hysteria2 password (from server install)"
+    read -p ": " hy2_password
+    [[ -z "${hy2_password}" ]] && exception "Hysteria2 password must be set!"
+
+    echo "Enter Hysteria2 salamander obfs password (from server install)"
+    read -p ": " hy2_obfs
+    [[ -z "${hy2_obfs}" ]] && exception "Hysteria2 obfs password must be set!"
+
     ensure_singbox_user
     mkdir -p /etc/sing-box
 
@@ -714,18 +780,23 @@ else
     fi
 
     echo "------ Writing /etc/sing-box/config.json (client)"
-    write_singbox_client_config "${server_ip}" "${reality_uuid}" "${reality_pubkey}" "${reality_shortid}" "${reality_sni}"
+    write_singbox_client_config "${server_ip}" "${reality_uuid}" "${reality_pubkey}" \
+        "${reality_shortid}" "${reality_sni}" "${hy2_password}" "${hy2_obfs}"
 
-    # Note: rule_sets (CN bypass, GFW list, etc.) are remote and fetched by
+    # Note: rule_sets (cnsite/cnip/cngames) are remote and fetched by
     # sing-box itself on its own schedule (update_interval in config.json).
-    # On first boot, traffic falls through to `final: "proxy"` until those
-    # downloads complete (typically <30s); no local pre-fetch needed.
+    # On first boot, traffic falls through to `final: "proxy_tcp"` (and
+    # `network:udp → proxy_udp` for UDP) until those downloads complete
+    # (typically <30s); no local pre-fetch needed.
 
     echo "------ Writing /etc/systemd/system/sing-box.service"
     create_singbox_client_service
 
     echo "------ Enabling IP forwarding"
     enable_ip_forward
+
+    echo "------ Tuning UDP socket buffers (for hysteria2 outbound)"
+    tune_udp_buffers
 
     echo "------ Enabling BBR congestion control"
     enable_bbr
@@ -754,7 +825,7 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  ServerName   : ${red} ${reality_dest} ${plain}"
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
-    echo -e "${green}Hysteria2 (UDP/443, port-hopping ${hy2_port_hop_start}-${hy2_port_hop_end})${plain} — UDP fallback for QUIC-loving clients:"
+    echo -e "${green}Hysteria2 (UDP/443, port-hopping ${hy2_port_hop_start}-${hy2_port_hop_end})${plain} — used by the gateway for all proxied UDP, and also available to standalone QUIC-loving clients:"
     echo -e "  Address          : ${red} $(get_ip) ${plain}"
     echo -e "  Port (single)    : ${red} 443 ${plain}"
     echo -e "  Port-hop range   : ${red} ${hy2_port_hop_start}-${hy2_port_hop_end} ${plain}  (client format: ${yellow}server:443,${hy2_port_hop_start}-${hy2_port_hop_end}${plain})"
@@ -784,9 +855,12 @@ else
     echo -e "  ${yellow}journalctl -u sing-box -f${plain}"
     echo -e "  ${yellow}ip link show singtun0${plain}                   # TUN device (auto_route)"
     echo -e "  ${yellow}ip route show table all | grep singtun0${plain} # routes auto-installed by sing-box"
-    echo -e "  ${yellow}ls -lh /var/lib/sing-box${plain}                # cached rule_sets (cnsite/cnip/gfw/cngames)"
+    echo -e "  ${yellow}ls -lh /var/lib/sing-box${plain}                # cached rule_sets (cnsite/cnip/cngames)"
+    echo -e "  ${yellow}journalctl -u sing-box | grep proxy_udp${plain} # confirm UDP traffic uses hy2"
+    echo -e "  ${yellow}journalctl -u sing-box | grep proxy_tcp${plain} # confirm TCP traffic uses vless"
     echo -e "  From a LAN device pointed at this gateway (gateway + DNS):"
-    echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP"
+    echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP (TCP → vless)"
     echo -e "  ${yellow}curl https://www.baidu.com -I${plain}           # should bypass proxy (CN-route)"
     echo -e "  ${yellow}dig @<gateway-LAN-ip> www.google.com${plain}    # should answer in fakeip range (198.18/15)"
+    echo -e "  ${yellow}curl --http3-only https://cloudflare.com -I${plain}  # exercises QUIC/UDP via hy2 (curl ≥7.88)"
 fi
