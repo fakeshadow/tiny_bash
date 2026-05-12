@@ -2,46 +2,56 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-# Two-mode VPN install script.
+# Two-mode VPN install script. sing-box on both sides.
 #
 # Server (mode 1): sing-box with two inbounds:
 #                    * vless+reality        on TCP/443  (primary, max stealth)
 #                    * hysteria2+salamander on UDP/443  (UDP fallback,
 #                                                        with port hopping)
 #
-# Client (mode 2): xray + dokodemo-door TPROXY inbound + vless+reality
-#                  outbound, as a transparent gateway for LAN devices.
-#                  Client uses Reality TCP only; the server's hy2 inbound
-#                  is for external mobile/desktop clients that prefer UDP.
+# Client (mode 2): sing-box with a TUN inbound and TWO proxy outbounds —
+#                  vless+reality on TCP (tag "proxy_tcp") and
+#                  hysteria2+salamander on UDP (tag "proxy_udp", with
+#                  port hopping 20000-50000 → :443) — as a transparent
+#                  gateway for LAN devices. Route rules split by network:
+#                  TCP → vless, UDP → hy2, CN-bound → direct. Network
+#                  restrictions ("network":"tcp"/"udp") are declared on
+#                  each proxy outbound so a misrouted packet errors loudly
+#                  instead of silently re-enabling xudp.
 #
-# Flow choice (asymmetric, by design):
-#   * Server inbound:  "xtls-rprx-vision"           (only accepted value)
-#   * Client outbound: "xtls-rprx-vision-udp443"    (this gateway only)
+# Why split TCP/UDP onto two transports: vless+Vision is a single TCP
+# tunnel; piling UDP on it via xudp (a) suffers TCP head-of-line blocking
+# under loss, and (b) leaves the per-port UDP-throttling problem
+# unsolved since the wire packets are still TCP/443. hy2 over QUIC has
+# independent streams and native port-hopping, so it's the right
+# transport for UDP. With UDP off the Reality tunnel, vless carries only
+# TCP — narrower scope, less HoL damage from any one stall.
 #
-# The default Vision flow rejects UDP/443 client-side because QUIC over
-# Vision is double-TLS (QUIC's own TLS 1.3 inside Vision's outer TLS 1.3)
-# — wasteful when you can disable QUIC at the LAN client and let it fall
-# back to TCP. We can't do that on a transparent gateway (every LAN
-# device would need the toggle), so the gateway opts into the "-udp443"
-# variant: it sets allowUDP443=true locally and strips the suffix
-# (requestAddons.Flow = requestAddons.Flow[:16]) BEFORE the value hits
-# the wire. The server therefore only ever sees "xtls-rprx-vision" and
-# its inbound flow validator (which only accepts that exact string)
-# stays happy. Sources:
-#   * outbound.go (rejection + suffix strip): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/outbound/outbound.go
-#   * inbound.go (server-side flow validator): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/inbound/inbound.go
+# Flow choice (same string on both sides — sing-box does the right thing):
+#   * Server inbound:  "xtls-rprx-vision"
+#   * Client outbound: "xtls-rprx-vision"  (TCP only; UDP goes via hy2)
 #
-# Non-443 UDP (Discord voice, NTP, game servers, etc.) is not affected
-# by either guard — the rejection check only fires when port==443.
+# In xray, plain "xtls-rprx-vision" rejects UDP/443 client-side because
+# QUIC-over-Vision is double-TLS, so xray defines a separate
+# "xtls-rprx-vision-udp443" variant that flips allowUDP443=true and
+# strips the suffix before the value hits the wire. sing-box's
+# "xtls-rprx-vision" implementation has *no* port-443 UDP guard at all —
+# it behaves like xray's -udp443 variant by default. So a transparent
+# gateway that can't disable QUIC per-LAN-device just uses the plain
+# value. Sources:
+#   * sing-box vision impl (no 443 filter): https://raw.githubusercontent.com/sagernet/sing-vmess/main/vless/vision.go
+#   * sing-box issue #587 (confirms UDP/443 not blocked): https://github.com/SagerNet/sing-box/issues/587
+#   * nekoray issue #898 (cross-impl equivalence note): https://github.com/MatsuriDayo/nekoray/issues/898
+#   * xray Vision (for contrast): https://github.com/XTLS/Xray-core/blob/main/proxy/vless/outbound/outbound.go
 #
-# The client side follows Project X's official transparent-proxy guide,
-# verbatim where possible. Source references are inlined next to each
-# non-trivial config block:
-#   * https://xtls.github.io/en/document/level-2/transparent_proxy/transparent_proxy.html
-#   * https://xtls.github.io/en/document/level-2/tproxy.html
-#   * https://xtls.github.io/en/document/level-2/tproxy_ipv4_and_ipv6.html
-#   * https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision-REALITY
-#   * https://github.com/XTLS/Xray-install
+# Client architecture references (high-level — see the comment block above
+# write_singbox_client_config for the per-section details with sources):
+#   * TUN inbound:        https://sing-box.sagernet.org/configuration/inbound/tun/
+#   * Route + rule_set:   https://sing-box.sagernet.org/configuration/route/
+#   * 1.12+ rule actions: https://sing-box.sagernet.org/migration/
+#   * VLESS+Reality out:  https://sing-box.sagernet.org/configuration/outbound/vless/
+#   * Hysteria2 out:      https://sing-box.sagernet.org/configuration/outbound/hysteria2/
+#   * Rule sets source:   https://github.com/MetaCubeX/meta-rules-dat
 #
 # System Required: Ubuntu 26.04
 #
@@ -50,33 +60,31 @@ export PATH
 
 # --- pinned versions / URLs ------------------------------------------------
 
-# Server uses sing-box. Bump as needed: https://github.com/SagerNet/sing-box/releases
+# Both sides use sing-box. Bump as needed: https://github.com/SagerNet/sing-box/releases
 singbox_version="1.13.11"
-singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-amd64.tar.gz"
 
-# Client uses xray. Bump as needed: https://github.com/XTLS/Xray-core/releases
-xray_version="26.3.27"
-# Ordered list of URL templates for the xray-core release zip. The script
-# tries each in order and uses the first one that responds. Two %s slots:
-# the version (without leading "v"), and the arch tag ("64" or "arm64-v8a").
+# Server-side download URL. The server is overseas and has direct GitHub
+# access; no mirror chain needed here. Three %s slots: version (URL path),
+# version (tarball name), arch ("amd64" or "arm64") — same format as the
+# client mirror chain below so the URL strings stay aligned.
+singbox_url_gh="https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
+
+# Client-side mirror chain. Client is typically inside CN where direct
+# GitHub is rate-limited / RST'd, so we try CN-friendly proxies first
+# and fall back to direct GitHub last. Three %s slots: version (URL
+# path), version (tarball name), arch ("amd64" or "arm64"). Same
+# mirror pattern as the (now-removed) xray client install — those
+# proxies front any github.com URL, the path is opaque to them.
 #
-# No single CN-friendly mirror is reliably up — what works rotates over time.
-# If you find a better mirror, prepend it to this list. If they all die,
-# the manual escape hatch is documented in install_xray() below.
-# Each entry below was probed at script-write time: HTTP 200 + a real ZIP
-# header byte (50 4b 03 04) on a range-GET, not just a HEAD ping. If you
-# find a better mirror (or one of these dies), prepend/swap freely.
-xray_url_templates=(
-    "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-    "https://kkgithub.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-    "https://gh.ddlc.top/https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
-    "https://github.com/XTLS/Xray-core/releases/download/v%s/Xray-linux-%s.zip"
+# If you find a better mirror or one of these dies, prepend/swap freely.
+# Manual escape hatch is documented in install_singbox_client() below.
+singbox_client_url_templates=(
+    "https://gh-proxy.com/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
+    "https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
+    "https://kkgithub.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
+    "https://gh.ddlc.top/https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
+    "https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz"
 )
-
-# TPROXY listening port on the gateway (xray's dokodemo-door inbound).
-# Per xtls.github.io tproxy.html the default is 12345; no reason to change.
-tproxy_port=12345
 
 # Hysteria2 port-hopping range (server side). The hy2 socket binds only
 # to UDP/443; an nftables NAT redirect maps this whole UDP range onto
@@ -88,23 +96,10 @@ tproxy_port=12345
 hy2_port_hop_start=20000
 hy2_port_hop_end=50000
 
-# CN-route bypass: weekly-refreshed list of CN-bound CIDRs loaded into an
-# nftables set. Packets to those destinations RETURN early (skip TPROXY)
-# and reach the local network direct via the kernel's normal forwarding
-# path — zero userspace hop, full LAN throughput.
-#
-# Source: misakaio/chnroutes2 (BGP-derived, hourly upstream refresh, was
-# already used by the original tiny.sh). IPv6 list isn't published by this
-# project; v4 only.
-#
-# Each entry below was probed live (HTTP 200 + real CIDR file body), same
-# proxies that work for the xray binary download.
-chnroutes_url_templates=(
-    "https://gh-proxy.com/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://ghfast.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://gh.ddlc.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-)
+# CN-route bypass is handled in-config via remote rule_sets pulled from
+# MetaCubeX/meta-rules-dat (see route.rule_set in write_singbox_client_config).
+# sing-box fetches and refreshes those on its own schedule, so the script
+# no longer needs a local .srs file or weekly cron.
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -142,8 +137,14 @@ install_singbox_from() {
 
 install_singbox() {
     local v="${singbox_version}"
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) exception "Unsupported architecture for sing-box: $(uname -m)" ;;
+    esac
     local gh
-    gh=$(printf "${singbox_url_gh}" "$v" "$v")
+    gh=$(printf "${singbox_url_gh}" "$v" "$v" "$arch")
     install_singbox_from "$gh" || exception "Failed to download sing-box ${v} from GitHub"
 }
 
@@ -211,369 +212,325 @@ SVC_EOF
     systemctl enable sing-box.service
 }
 
-# --- client-only helpers (xray + TPROXY) ----------------------------------
+# --- client-only helpers (sing-box + TUN) ---------------------------------
 
-# Try a single URL. Returns 0 on success, nonzero on download/extract
-# failure so the caller can fall through to another mirror.
-install_xray_from() {
-    local url="$1"
-    local tmp
-    tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
-    # Aggressive connect timeout so dead mirrors fail fast (we have several
-    # to try). max-time stays generous for the 21MB transfer over slow links.
-    curl -fsSL --connect-timeout 8 --max-time 180 "$url" -o "$tmp/xray.zip" || return 1
-    unzip -q "$tmp/xray.zip" -d "$tmp/x" || return 1
-    install -m 755 "$tmp/x/xray" /usr/local/bin/xray
-    mkdir -p /usr/local/etc/xray
-}
-
-# Tries each entry of xray_url_templates in order. First success wins.
+# Tries each entry of singbox_client_url_templates in order, first success
+# wins. install_singbox_from() is shared with the server side — it's the
+# tarball-fetch primitive; this function just adds CN-friendly mirror
+# fallback and arch detection on top.
 #
 # Manual escape hatch — if all mirrors fail in your network:
 #   1. From any machine with working GitHub access (e.g. your overseas
-#      server), download and copy the zip to the gateway:
-#        wget https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-linux-64.zip
-#        scp Xray-linux-64.zip gateway:/tmp/
+#      server), download and copy the tarball to the gateway:
+#        wget https://github.com/SagerNet/sing-box/releases/download/v${singbox_version}/sing-box-${singbox_version}-linux-amd64.tar.gz
+#        scp sing-box-${singbox_version}-linux-amd64.tar.gz gateway:/tmp/
 #   2. On the gateway: pre-place the binary so this script's `command -v
-#      xray` check short-circuits the download:
-#        sudo unzip /tmp/Xray-linux-64.zip -d /tmp/xray
-#        sudo install -m 755 /tmp/xray/xray /usr/local/bin/xray
-#   3. Re-run sudo ./tiny.sh — install_xray will be skipped entirely.
-install_xray() {
-    local v="${xray_version}"
+#      sing-box` check short-circuits the download:
+#        sudo tar -xzf /tmp/sing-box-*.tar.gz -C /tmp/ --strip-components=1
+#        sudo install -m 755 /tmp/sing-box /usr/local/bin/sing-box
+#   3. Re-run sudo ./tiny.sh — install will be skipped entirely.
+install_singbox_client() {
+    local v="${singbox_version}"
     local arch
     case "$(uname -m)" in
-        x86_64|amd64) arch="64" ;;
-        aarch64|arm64) arch="arm64-v8a" ;;
-        *) exception "Unsupported architecture for xray: $(uname -m)" ;;
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) exception "Unsupported architecture for sing-box: $(uname -m)" ;;
     esac
     local tmpl url
-    for tmpl in "${xray_url_templates[@]}"; do
-        url=$(printf "${tmpl}" "$v" "$arch")
+    for tmpl in "${singbox_client_url_templates[@]}"; do
+        url=$(printf "${tmpl}" "$v" "$v" "$arch")
         echo "------ Trying: ${url}"
-        if install_xray_from "$url"; then
-            echo "[${green}OK${plain}] xray ${v} installed."
+        if install_singbox_from "$url"; then
+            echo "[${green}OK${plain}] sing-box ${v} installed."
             return 0
         fi
         echo "[${yellow}Warn${plain}] Failed; trying next mirror..."
     done
-    exception "All xray mirrors failed. See manual escape hatch in install_xray() comment in tiny.sh."
+    exception "All sing-box mirrors failed. See manual escape hatch in install_singbox_client() comment in tiny.sh."
 }
 
-# Replicates the systemd unit that XTLS/Xray-install/install-release.sh
-# generates — User=nobody, ambient CAP_NET_ADMIN (needed for TPROXY bind),
-# CAP_NET_BIND_SERVICE for low ports, RestartPreventExitStatus=23
-# (xray's "configuration error" exit code, so a bad config doesn't churn).
-create_xray_service() {
-cat <<'XRAYSVC_EOF' > /etc/systemd/system/xray.service
+# Same systemd unit as the server, just retagged. Runs as the sing-box
+# system user; CAP_NET_ADMIN is required by the TUN inbound (open
+# /dev/net/tun, install routes, set up auto_route's ip rules).
+# Source: https://sing-box.sagernet.org/installation/package-manager/#systemd
+create_singbox_client_service() {
+cat <<'SVC_EOF' > /etc/systemd/system/sing-box.service
 [Unit]
-Description=Xray Service
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
+Description=sing-box service (client)
+Wants=network-online.target
+After=network-online.target nss-lookup.target
 
 [Service]
-User=nobody
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+User=sing-box
+Group=sing-box
+ExecStart=/usr/local/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
+RestartSec=5
+LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
-XRAYSVC_EOF
+SVC_EOF
+    mkdir -p /var/lib/sing-box
+    chown -R sing-box:sing-box /var/lib/sing-box /etc/sing-box
     systemctl daemon-reload
-    systemctl enable xray.service
+    systemctl enable sing-box.service
 }
 
-# Client config. Inbound block is the dokodemo-door TPROXY pattern from
-# xtls.github.io/en/document/level-2/tproxy.html . Outbound block is the
-# VLESS+Reality+Vision client template from
-# https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision-REALITY .
-# `streamSettings.sockopt.mark = 255` (0xff) makes xray's own outbound
-# traffic carry fwmark 0xff so the nftables rule below can RETURN it
-# without sending it back through TPROXY (loop avoidance).
+# Client config — written against the sing-box 1.13.x schema. TUN inbound
+# captures all LAN-forwarded traffic; auto_route + auto_redirect +
+# auto_detect_interface together install policy routes (auto_route) +
+# nftables redirect rules (auto_redirect, "better than tproxy" per
+# upstream) + bind sing-box's own outbound sockets to the physical NIC
+# (auto_detect_interface, the equivalent of xray's `sockopt.mark = 0xff`
+# for loop avoidance).
 #
-# Note: sniffing.routeOnly is FALSE here, deviating from the SOCKS5-style
-# template in Xray-examples (which uses true). The reason is that this is
-# a transparent gateway — LAN clients pre-resolve hostnames via their own
-# DNS, which gives them region-local edge IPs (CN-routed for CN clients).
-# If we keep routeOnly:true, xray forwards "connect to <LAN-resolved-IP>"
-# to the server, and the overseas server's outbound dial lands on a CN
-# edge from a non-CN source. Strict geo-CDN sites (YouTube/googlevideo,
-# some Akamai-fronted sites) RST that mid-TLS-handshake. With
-# routeOnly:false, xray forwards the sniffed SNI hostname instead, and
-# the server resolves it via its own DNS — source/destination regions
-# match, the edge serves the request normally.
-write_xray_client_config() {
-    local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5" spiderx="$6"
-cat <<'CFG_EOF' > /usr/local/etc/xray/config.json
+# DNS architecture (split-horizon + fakeip):
+#   * proxy_dns  — DoH to dns.google via `detour: "proxy_tcp"`. Handles
+#                  non-A/AAAA queries (TXT/MX/etc.) and is the `final` server.
+#                  `domain_resolver: "cn_dns"` is required because the server
+#                  field is a hostname (sing-box resolves it once at startup).
+#   * cn_dns     — type "local": delegates to the gateway OS's resolver
+#                  (systemd-resolved on Ubuntu 26.04). Used to resolve CN sites
+#                  so they get region-local CDN edges. Loop-safe under TUN DNS
+#                  hijack because "local" uses systemd-resolved's D-Bus interface
+#                  on Linux, not UDP/53.
+#   * fakeip     — synthetic IP allocator (198.18.0.0/15 / fc00::/18). Returns
+#                  a deterministic fake IP for every proxied A/AAAA query. When
+#                  the LAN client connects to that fake IP, sing-box's router
+#                  detects the fakeip-range destination and rewrites
+#                  metadata.Destination.Fqdn back to the original hostname
+#                  BEFORE the outbound dial — so the overseas server receives
+#                  "connect to <hostname>" and resolves it from its own clean
+#                  DNS. This is the sing-box equivalent of xray's
+#                  `sniffing.destOverride + routeOnly:false` (see master branch).
+#
+# Why fakeip and not plain `sniff`: sing-box 1.13.0 removed the legacy
+# `sniff_override_destination` inbound field, and the route-rule `sniff` action
+# does not expose an equivalent option in JSON. Sniff still populates
+# `metadata.Domain` for routing decisions, but does NOT rewrite the outbound
+# destination. Without fakeip the gateway forwards the LAN-resolved (often
+# GFW-poisoned) IP to the server, which then times out dialing it. Sources:
+#   * route.go fakeip reverse-mapping:
+#       https://github.com/SagerNet/sing-box/blob/v1.13.11/route/route.go
+#   * RuleActionSniff — OverrideDestination is marked Deprecated and no longer
+#     reachable from JSON config:
+#       https://github.com/SagerNet/sing-box/blob/v1.13.11/route/rule/rule_action.go
+#   * fakeip server schema:
+#       https://sing-box.sagernet.org/configuration/dns/server/fakeip/
+#
+# Hard requirement: LAN clients MUST use this gateway as their DNS server,
+# otherwise they bypass fakeip entirely. Force it via DHCP option 6 on the
+# LAN router (advertise this gateway's LAN IP as the only DNS server). LAN
+# devices that ignore DHCP DNS (Chrome auto-DoH, iOS/Android Private DNS
+# pointed at an external DoT endpoint, hard-coded resolvers like Chromecast
+# / smart-TV sticks, etc.) will still leak — block known DoH/DoT endpoints
+# with additional route rules if you have such devices.
+#
+# Upstream tracking — both constraints above (needing fakeip at all, AND
+# needing to force gateway-as-DNS for every LAN device) would disappear if
+# sing-box restored any mechanism to set metadata.Destination from the
+# sniffed domain. Two plausible paths that would lift it:
+#   * Expose the (currently-deprecated, hidden-from-JSON) `OverrideDestination`
+#     field of the route-rule `sniff` action — this is what the master
+#     branch's xray client already does via `sniffing.routeOnly: false`.
+#   * Add a new `route-options` flag (e.g. `use_sniffed_domain: true`) that
+#     copies metadata.Domain into metadata.Destination.Fqdn post-sniff.
+#
+# Upstream has so far rejected requests to restore the legacy
+# `sniff_override_destination` field — see SagerNet/sing-box issues
+# #3982, #3951, #4011, all closed "completed" with fakeip pointed at as
+# the canonical workaround. Re-check those (and any successor) on each
+# sing-box bump; if either mechanism above lands, the fakeip server,
+# the A/AAAA→fakeip DNS rule, AND the LAN-must-use-gateway-DNS
+# requirement can all be dropped.
+#
+# CN sites are exempted from fakeip via the rule_set=cnsite DNS rule
+# (matched FIRST, before the A/AAAA→fakeip catch-all), so they keep real
+# CN-edge IPs and match the cnsite/cnip route rules → direct outbound.
+# cngames domains aren't in the cnsite DNS rule (they're not CN sites,
+# they're non-CN games tagged for CN-direct routing), so they DO get
+# fakeip → reverse-mapped to hostname → matched by the cngames route
+# rule → direct. That works but is one round-trip wasteful; adding
+# cngames to the DNS rules would skip the indirection.
+#
+# DNS hijack on LAN: the route rule
+# `{ "protocol": "dns", "action": "hijack-dns" }` catches UDP/53 packets
+# from LAN clients (regardless of upstream the client aimed at) and feeds
+# them into the DNS module above. Without it, LAN clients' DNS queries
+# leak past sing-box and hit (often poisoned) upstream resolvers
+# directly. The legacy TUN-inbound `dns_mode` field was removed in
+# sing-box 1.13, so this route rule is now the only path to DNS hijack.
+# Source: https://sing-box.sagernet.org/configuration/route/rule_action/#hijack-dns
+#
+# rule_sets are fetched remotely from MetaCubeX/meta-rules-dat (the most
+# actively-maintained sing-box rule_set repo), refreshed every 24h via
+# `update_interval`. Initial fetch happens after sing-box starts, so on
+# first boot all traffic falls through to `final: "proxy_tcp"` until those
+# downloads complete (~30s). `download_detour: "proxy_tcp"` routes the
+# fetches through the TCP tunnel — important because
+# raw.githubusercontent.com isn't reachable from inside the GFW.
+#
+# Earlier revisions of this client config carried a `gfw` rule_set
+# (geosite blocked-from-CN list). It's been removed: with the new
+# `final: "proxy_tcp"` and `network:udp → proxy_udp` catch-all rules at
+# the bottom of route.rules, "everything not classified as CN goes via
+# the proxy" — so an explicit gfw match is redundant. One less rule_set
+# to fetch / cache / re-download.
+#
+# Refs:
+#   * TUN options:        https://sing-box.sagernet.org/configuration/inbound/tun/
+#   * Route + rule_set:   https://sing-box.sagernet.org/configuration/route/
+#   * DNS local server:   https://sing-box.sagernet.org/configuration/dns/server/local/
+#   * DNS https server:   https://sing-box.sagernet.org/configuration/dns/server/https/
+#   * VLESS+Reality out:  https://sing-box.sagernet.org/configuration/outbound/vless/
+#   * Hysteria2 out:      https://sing-box.sagernet.org/configuration/outbound/hysteria2/
+#   * Rule sets source:   https://github.com/MetaCubeX/meta-rules-dat
+#
+# Note on `flow`: sing-box's "xtls-rprx-vision" has no UDP/443 guard, so
+# it works as the gateway's outbound flow without the xray-specific
+# "-udp443" suffix. In our split, UDP doesn't reach vless at all
+# (route rule + `"network":"tcp"` restriction on the outbound), so the
+# 443-UDP guard would be moot here regardless. See header notes (top of
+# this file) for sources.
+write_singbox_client_config() {
+    local server_ip="$1" uuid="$2" pubkey="$3" sid="$4" sni="$5" \
+          hy2_pw="$6" hy2_obfs="$7"
+cat <<'CFG_EOF' > /etc/sing-box/config.json
 {
-  "log": { "loglevel": "warning" },
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxy_dns",
+        "type": "https",
+        "server": "dns.google",
+        "domain_resolver": "cn_dns",
+        "detour": "proxy_tcp"
+      },
+      {
+        "tag": "cn_dns",
+        "type": "local"
+      },
+      {
+        "tag": "fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      { "rule_set": "cnsite", "server": "cn_dns" },
+      { "query_type": ["A", "AAAA"], "server": "fakeip" }
+    ],
+    "final": "proxy_dns",
+    "independent_cache": true
+  },
   "inbounds": [
     {
-      "tag": "tproxy-in",
-      "listen": "0.0.0.0",
-      "port": ___TPROXY_PORT___,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "network": "tcp,udp",
-        "followRedirect": true
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"],
-        "routeOnly": false
-      },
-      "streamSettings": {
-        "sockopt": { "tproxy": "tproxy" }
-      }
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "singtun0",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "mtu": 1500,
+      "auto_route": true,
+      "auto_redirect": true,
+      "strict_route": true,
+      "stack": "system"
     }
   ],
   "outbounds": [
     {
-      "tag": "proxy",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "___SERVER_IP___",
-            "port": 443,
-            "users": [
-              {
-                "id": "___UUID___",
-                "encryption": "none",
-                "flow": "xtls-rprx-vision-udp443"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "fingerprint": "chrome",
-          "serverName": "___SNI___",
-          "publicKey": "___PUBKEY___",
-          "shortId": "___SID___",
-          "spiderX": "___SPIDERX___"
-        },
-        "sockopt": { "mark": 255 }
+      "type": "vless",
+      "tag": "proxy_tcp",
+      "network": "tcp",
+      "server": "___SERVER_IP___",
+      "server_port": 443,
+      "uuid": "___UUID___",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "___SNI___",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": {
+          "enabled": true,
+          "public_key": "___PUBKEY___",
+          "short_id": "___SID___"
+        }
       }
     },
     {
-      "tag": "direct",
-      "protocol": "freedom",
-      "streamSettings": { "sockopt": { "mark": 255 } }
-    }
+      "type": "hysteria2",
+      "tag": "proxy_udp",
+      "network": "udp",
+      "server": "___SERVER_IP___",
+      "server_port": 443,
+      "server_ports": ["___HY2_HOP_START___:___HY2_HOP_END___"],
+      "password": "___HY2_PW___",
+      "obfs": { "type": "salamander", "password": "___HY2_OBFS___" },
+      "tls": { "enabled": true, "insecure": true }
+    },
+    { "type": "direct", "tag": "direct" }
   ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "cn_dns",
+    "rule_set": [
       {
-        "type": "field",
-        "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"],
-        "outboundTag": "direct"
+        "tag": "cnsite",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/cn.srs",
+        "update_interval": "24h",
+        "download_detour": "proxy_tcp"
       },
       {
-        "type": "field",
-        "network": "udp",
-        "port": 53,
-        "outboundTag": "direct"
+        "tag": "cnip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geoip/cn.srs",
+        "update_interval": "24h",
+        "download_detour": "proxy_tcp"
       },
       {
-        "type": "field",
-        "network": "tcp,udp",
-        "outboundTag": "proxy"
+        "tag": "cngames",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/geosite/category-games-!cn@cn.srs",
+        "update_interval": "24h",
+        "download_detour": "proxy_tcp"
       }
-    ]
+    ],
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "network": "icmp", "outbound": "direct" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "rule_set": "cnsite", "outbound": "direct" },
+      { "rule_set": "cnip", "outbound": "direct" },
+      { "rule_set": "cngames", "outbound": "direct" },
+      { "network": "udp", "outbound": "proxy_udp" }
+    ],
+    "final": "proxy_tcp"
   }
 }
 CFG_EOF
     sed -i \
-        -e "s|___TPROXY_PORT___|${tproxy_port}|g" \
         -e "s|___SERVER_IP___|${server_ip}|g" \
         -e "s|___UUID___|${uuid}|g" \
         -e "s|___PUBKEY___|${pubkey}|g" \
         -e "s|___SID___|${sid}|g" \
         -e "s|___SNI___|${sni}|g" \
-        -e "s|___SPIDERX___|${spiderx}|g" \
-        /usr/local/etc/xray/config.json
-}
-
-# Translation of the canonical iptables/nftables rules from
-# https://xtls.github.io/en/document/level-2/tproxy_ipv4_and_ipv6.html .
-# The hex mark 0x000000ff and 0x00000001 values come from that doc; they
-# are not magic numbers, they line up with the `mark: 255` set on xray's
-# outbounds and the fwmark used by the policy routing service below.
-write_tproxy_nftables() {
-cat <<'NFTEOF' > /etc/nftables.conf
-#!/usr/sbin/nft -f
-
-# Idempotent: only flush our own table — coexists with whatever else the
-# system may load (e.g. ufw / docker tables).
-add table inet xray
-flush table inet xray
-
-table inet xray {
-    # CN-route bypass set. Populated/refreshed by /usr/local/sbin/update-chnroutes
-    # via the include directive at the bottom of this file.
-    set cn_ipv4 {
-        type ipv4_addr
-        flags interval
-    }
-
-    chain prerouting {
-        type filter hook prerouting priority filter; policy accept;
-
-        # 1. Skip TPROXY for traffic that should never be proxied:
-        #    loopback, multicast, broadcast.
-        ip daddr { 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
-
-        # 2. LAN-internal TCP stays local. LAN-internal UDP also stays
-        #    local UNLESS it is DNS (so we can intercept DNS to the
-        #    gateway's IP if a client points there).
-        meta l4proto tcp ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
-        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } udp dport != 53 return
-
-        # 3. IPv6 link-local + unique-local mirror the v4 LAN exemptions.
-        ip6 daddr { ::1, fe80::/10 } return
-        meta l4proto tcp ip6 daddr fc00::/7 return
-        ip6 daddr fc00::/7 udp dport != 53 return
-
-        # 4. Loop avoidance: xray's own outbound packets (mark 0xff set
-        #    via streamSettings.sockopt.mark) bypass TPROXY.
-        meta mark 0x000000ff return
-
-        # 5. CN-bound traffic bypasses the proxy entirely — let the
-        #    kernel's normal forwarding path send it out via WAN direct.
-        ip daddr @cn_ipv4 return
-
-        # 6. Everything else: TPROXY to xray, mark with 0x1 so the policy
-        #    routing rule below delivers the packet to the local socket.
-        meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip to 127.0.0.1:___TPROXY_PORT___ accept
-        meta l4proto { tcp, udp } meta mark set 0x00000001 tproxy ip6 to [::1]:___TPROXY_PORT___ accept
-    }
-}
-
-# Populated weekly by /etc/cron.weekly/update-chnroutes. The file must
-# exist (even as a placeholder) for nftables.service to start cleanly.
-include "/etc/nftables.d/chnroutes.nft"
-NFTEOF
-    sed -i "s|___TPROXY_PORT___|${tproxy_port}|g" /etc/nftables.conf
-}
-
-# Writes the chnroutes updater + its weekly cron + an empty placeholder
-# for the included nftables fragment. The placeholder is required because
-# /etc/nftables.conf does `include "/etc/nftables.d/chnroutes.nft"` and
-# nftables.service fails to start if the file is missing.
-write_chnroutes_assets() {
-    mkdir -p /etc/nftables.d
-    if [[ ! -f /etc/nftables.d/chnroutes.nft ]]; then
-        echo "# placeholder — populated by /usr/local/sbin/update-chnroutes" \
-            > /etc/nftables.d/chnroutes.nft
-    fi
-
-cat <<'UPD_EOF' > /usr/local/sbin/update-chnroutes
-#!/usr/bin/env bash
-# Refresh /etc/nftables.d/chnroutes.nft with the latest CN CIDR list,
-# then atomically reload it into the live `inet xray.cn_ipv4` set.
-# Source: misakaio/chnroutes2 (BGP-derived, hourly upstream refresh).
-set -euo pipefail
-
-URLS=(
-    "https://gh-proxy.com/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://ghfast.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://gh.ddlc.top/https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-    "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
-)
-
-OUT=/etc/nftables.d/chnroutes.nft
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-fetched=
-for url in "${URLS[@]}"; do
-    if curl -fsSL --connect-timeout 8 --max-time 60 "$url" -o "$TMP/raw.txt"; then
-        echo "[update-chnroutes] fetched: $url" >&2
-        fetched=1
-        break
-    fi
-    echo "[update-chnroutes] failed: $url" >&2
-done
-[[ "$fetched" ]] || { echo "[update-chnroutes] all mirrors failed" >&2; exit 1; }
-
-# Strip comments + empty lines.
-grep -Ev '^$|^#' "$TMP/raw.txt" > "$TMP/cidrs.txt"
-
-count=$(wc -l < "$TMP/cidrs.txt")
-if [[ "$count" -lt 1000 ]]; then
-    echo "[update-chnroutes] sanity fail: only $count CIDRs (expected >=1000)" >&2
-    exit 1
-fi
-
-# Build the include file: flush the existing set, then bulk-add the new
-# CIDRs. nft applies the file as a single transaction → atomic update.
-{
-    echo "# Auto-generated by /usr/local/sbin/update-chnroutes"
-    echo "# Source: misakaio/chnroutes2 — refreshed $(date -u +%FT%TZ)"
-    echo "flush set inet xray cn_ipv4"
-    echo "add element inet xray cn_ipv4 { $(paste -sd, "$TMP/cidrs.txt") }"
-} > "$OUT.new"
-mv "$OUT.new" "$OUT"
-
-# Apply atomically without disturbing other rules in the table.
-if ! nft -f "$OUT" 2> "$TMP/nft.err"; then
-    cat "$TMP/nft.err" >&2
-    exit 1
-fi
-
-echo "[update-chnroutes] loaded $count CIDRs into inet xray.cn_ipv4" >&2
-UPD_EOF
-    chmod +x /usr/local/sbin/update-chnroutes
-
-    mkdir -p /etc/cron.weekly
-cat <<'CRON_EOF' > /etc/cron.weekly/update-chnroutes
-#!/bin/sh
-# Refresh CN routes; output goes to syslog/journal.
-exec /usr/local/sbin/update-chnroutes
-CRON_EOF
-    chmod +x /etc/cron.weekly/update-chnroutes
-}
-
-# Policy routing: packets fwmark'd with 0x1 by the TPROXY rule are routed
-# to "lo" (delivered to local socket) via dedicated tables 100 (v4) and
-# 106 (v6). Numbers match xtls.github.io tproxy_ipv4_and_ipv6.html .
-write_tproxy_route_service() {
-cat <<'SVCEOF' > /etc/systemd/system/tproxy-route.service
-[Unit]
-Description=Policy routing for xray TPROXY (fwmark 0x1)
-After=network-pre.target nftables.service
-Wants=nftables.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-# Idempotent: ignore EEXIST on add, ignore ENOENT on del.
-ExecStart=-/sbin/ip -4 rule add fwmark 1 table 100
-ExecStart=-/sbin/ip -4 route add local default dev lo table 100
-ExecStart=-/sbin/ip -6 rule add fwmark 1 table 106
-ExecStart=-/sbin/ip -6 route add local default dev lo table 106
-ExecStop=-/sbin/ip -4 rule del fwmark 1 table 100
-ExecStop=-/sbin/ip -4 route flush table 100
-ExecStop=-/sbin/ip -6 rule del fwmark 1 table 106
-ExecStop=-/sbin/ip -6 route flush table 106
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-    systemctl daemon-reload
-    systemctl enable tproxy-route.service
+        -e "s|___HY2_PW___|${hy2_pw}|g" \
+        -e "s|___HY2_OBFS___|${hy2_obfs}|g" \
+        -e "s|___HY2_HOP_START___|${hy2_port_hop_start}|g" \
+        -e "s|___HY2_HOP_END___|${hy2_port_hop_end}|g" \
+        /etc/sing-box/config.json
 }
 
 # --- common helpers --------------------------------------------------------
@@ -588,12 +545,14 @@ EOF
 
 # BBR + fq is the loss-tolerant alternative to CUBIC, and it matters a
 # lot in this setup: the Reality tunnel is a single TCP connection
-# carrying ALL proxied traffic, so every segment loss head-of-line
-# stalls the whole tunnel for ~1 RTT. CN↔overseas paths routinely run
-# 0.3–1% loss at peak — CUBIC's throughput collapses to a few Mbps in
-# that range, BBR holds ~20+ Mbps. fq qdisc gives BBR proper packet
-# pacing (recommended pairing per the BBR authors). Both endpoints of
-# the Reality tunnel benefit, so it runs on server and client alike.
+# carrying ALL proxied TCP traffic, so every segment loss head-of-line
+# stalls every multiplexed stream on it for ~1 RTT. CN↔overseas paths
+# routinely run 0.3–1% loss at peak — CUBIC's throughput collapses to a
+# few Mbps in that range, BBR holds ~20+ Mbps. fq qdisc gives BBR proper
+# packet pacing (recommended pairing per the BBR authors). Both endpoints
+# of the Reality tunnel benefit, so it runs on server and client alike.
+# (hy2/QUIC is unaffected — QUIC has its own congestion control and
+# independent streams, so HoL doesn't apply across UDP traffic.)
 # Linux ≥ 4.9 ships BBR; Ubuntu 24.04+ has it auto-loadable.
 enable_bbr() {
 cat <<'EOF' > /etc/sysctl.d/99-bbr.conf
@@ -615,8 +574,9 @@ EOF
 # Hysteria2 over QUIC needs large UDP socket buffers — kernel defaults
 # (~200KB) cap throughput at ~50 Mbps regardless of link speed because
 # the QUIC fast-recovery window can't grow large enough. 16MB is the
-# value the hy2 docs recommend for 100Mbps+ links. Server-only: the
-# client side here uses TCP (Reality), not UDP.
+# value the hy2 docs recommend for 100Mbps+ links. Applied on BOTH sides
+# of the tunnel now: server runs the hy2 inbound, client runs the hy2
+# outbound (proxy_udp) for all proxied UDP traffic.
 # Source: https://v2.hysteria.network/docs/advanced/Performance-Optimization/
 tune_udp_buffers() {
 cat <<'EOF' > /etc/sysctl.d/99-udp-buffers.conf
@@ -626,9 +586,15 @@ EOF
     sysctl --system >/dev/null
 }
 
-# All heredocs in this script use quoted delimiters (<<'X') with
-# ___PLACEHOLDER___ tokens replaced via sed. Avoids bash mangling values
-# that start with digits (e.g. IPs like 199.x.x.x).
+# The JSON-config heredocs in this script use quoted delimiters
+# (<<'CFG_EOF') with ___PLACEHOLDER___ tokens replaced via sed afterward.
+# This avoids bash interpolation mangling values that start with digits
+# (e.g. IPs like 199.x.x.x), contain $ / `, or other shell metacharacters
+# (passwords, base64 strings). The one exception is
+# nftables_configure_server_hy2_hop's heredoc, which is unquoted
+# (<<NFTEOF) so bash interpolates the hy2_port_hop_start/end variables
+# directly — its only substituted values are integers, so the safety
+# concern doesn't apply.
 
 if [[ $EUID -ne 0 ]]; then
     command -v sudo >/dev/null 2>&1 || exception "Run as root or install sudo."
@@ -644,9 +610,10 @@ fi
 
 echo "------ Install dependencies"
 apt update
-# nftables is needed by the client (TPROXY rules); curl/openssl/tar are
-# common to both modes (singbox download / reality keys / xray installer).
-apt install -y curl ca-certificates openssl tar nftables iproute2 unzip cron
+# Server needs nftables (hy2 port-hop NAT) + openssl (self-signed cert).
+# Client needs nftables (auto_redirect uses it) + iproute2 (auto_route hooks).
+# curl/ca-certificates/tar are common to both (singbox tarball download).
+apt install -y curl ca-certificates openssl tar nftables iproute2
 
 if [[ "${platform}" == "1" ]]; then
     # ============================ SERVER =================================
@@ -771,8 +738,8 @@ CFG_EOF
 
 else
     # ============================ CLIENT =================================
-    # All five Reality values come from the server install printout —
-    # they must match the server's vless+reality inbound exactly.
+    # All Reality values come from the server install printout — they
+    # must match the server's vless+reality inbound exactly.
     echo "Enter your Server IP"
     read -p ": " server_ip
     [[ -z "${server_ip}" ]] && exception "Server IP must be set!"
@@ -793,58 +760,53 @@ else
     read -p "Default(www.cloudflare.com): " reality_sni
     reality_sni="${reality_sni:-www.cloudflare.com}"
 
-    # spiderX is optional. If your server's reality 'dest' is an IP-only
-    # endpoint, it can be empty; otherwise something like '/dns-query/'
-    # is fine. See Xray-examples/VLESS-TCP-XTLS-Vision-REALITY/config_client.jsonc .
-    echo "Enter Reality spiderX (optional, default empty)"
-    read -p "Default(empty): " reality_spiderx
+    # Note: xray had an extra "spiderX" parameter here; sing-box's reality
+    # outbound does not expose it (the path is fixed inside sing-vmess).
 
-    if ! command -v xray >/dev/null 2>&1; then
-        install_xray
+    echo "Enter Hysteria2 password (from server install)"
+    read -p ": " hy2_password
+    [[ -z "${hy2_password}" ]] && exception "Hysteria2 password must be set!"
+
+    echo "Enter Hysteria2 salamander obfs password (from server install)"
+    read -p ": " hy2_obfs
+    [[ -z "${hy2_obfs}" ]] && exception "Hysteria2 obfs password must be set!"
+
+    ensure_singbox_user
+    mkdir -p /etc/sing-box
+
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo "------ Installing sing-box ${singbox_version} (trying CN-friendly mirrors first)"
+        install_singbox_client
     fi
 
-    echo "------ Writing /usr/local/etc/xray/config.json (client)"
-    write_xray_client_config "${server_ip}" "${reality_uuid}" "${reality_pubkey}" "${reality_shortid}" "${reality_sni}" "${reality_spiderx}"
+    echo "------ Writing /etc/sing-box/config.json (client)"
+    write_singbox_client_config "${server_ip}" "${reality_uuid}" "${reality_pubkey}" \
+        "${reality_shortid}" "${reality_sni}" "${hy2_password}" "${hy2_obfs}"
 
-    echo "------ Writing /etc/nftables.conf (TPROXY rules)"
-    write_tproxy_nftables
+    # Note: rule_sets (cnsite/cnip/cngames) are remote and fetched by
+    # sing-box itself on its own schedule (update_interval in config.json).
+    # On first boot, traffic falls through to `final: "proxy_tcp"` (and
+    # `network:udp → proxy_udp` for UDP) until those downloads complete
+    # (typically <30s); no local pre-fetch needed.
 
-    echo "------ Installing chnroutes updater + weekly cron"
-    write_chnroutes_assets
-
-    echo "------ Writing tproxy-route.service (policy routing for fwmark 0x1)"
-    write_tproxy_route_service
-
-    echo "------ Writing /etc/systemd/system/xray.service"
-    create_xray_service
+    echo "------ Writing /etc/systemd/system/sing-box.service"
+    create_singbox_client_service
 
     echo "------ Enabling IP forwarding"
     enable_ip_forward
 
+    echo "------ Tuning UDP socket buffers (for hysteria2 outbound)"
+    tune_udp_buffers
+
     echo "------ Enabling BBR congestion control"
     enable_bbr
 
-    echo "------ Starting nftables / tproxy-route / xray"
-    systemctl enable nftables 2>/dev/null || true
-    systemctl restart nftables
-    systemctl restart tproxy-route.service
-    systemctl restart xray.service
-
-    echo "------ Populating chnroutes (initial fetch)"
-    if /usr/local/sbin/update-chnroutes; then
-        echo -e "[${green}OK${plain}] chnroutes loaded; CN traffic will bypass the proxy."
-    else
-        echo -e "[${yellow}Warn${plain}] chnroutes initial fetch failed — gateway works without CN bypass."
-        echo -e "[${yellow}Warn${plain}] Weekly cron will retry; manual: ${yellow}sudo /usr/local/sbin/update-chnroutes${plain}"
-    fi
+    echo "------ Starting sing-box"
+    systemctl restart sing-box.service
 
     sleep 2
-    if ! systemctl is-active --quiet xray; then
-        echo -e "[${red}Error${plain}] xray failed to start. Check: ${yellow}journalctl -u xray -n 50${plain}"
-        exit 1
-    fi
-    if ! systemctl is-active --quiet tproxy-route; then
-        echo -e "[${red}Error${plain}] tproxy-route failed. Check: ${yellow}journalctl -u tproxy-route -n 50${plain}"
+    if ! systemctl is-active --quiet sing-box; then
+        echo -e "[${red}Error${plain}] sing-box failed to start. Check: ${yellow}journalctl -u sing-box -n 50${plain}"
         exit 1
     fi
 fi
@@ -863,7 +825,7 @@ if [[ "${platform}" == "1" ]]; then
     echo -e "  ServerName   : ${red} ${reality_dest} ${plain}"
     echo -e "  Fingerprint  : ${red} chrome ${plain}"
     echo
-    echo -e "${green}Hysteria2 (UDP/443, port-hopping ${hy2_port_hop_start}-${hy2_port_hop_end})${plain} — UDP fallback for QUIC-loving clients:"
+    echo -e "${green}Hysteria2 (UDP/443, port-hopping ${hy2_port_hop_start}-${hy2_port_hop_end})${plain} — used by the gateway for all proxied UDP, and also available to standalone QUIC-loving clients:"
     echo -e "  Address          : ${red} $(get_ip) ${plain}"
     echo -e "  Port (single)    : ${red} 443 ${plain}"
     echo -e "  Port-hop range   : ${red} ${hy2_port_hop_start}-${hy2_port_hop_end} ${plain}  (client format: ${yellow}server:443,${hy2_port_hop_start}-${hy2_port_hop_end}${plain})"
@@ -881,12 +843,24 @@ else
     echo -e "Congratulations, ${green}Client${plain} install completed!"
     echo -e "Point your LAN devices' default gateway at this machine's LAN IP."
     echo
+    echo -e "${red}CRITICAL${plain}: LAN clients MUST use this gateway as their ${red}DNS server${plain} too"
+    echo -e "(DHCP option 6 → gateway LAN IP). The fakeip mechanism that lets the"
+    echo -e "overseas server resolve hostnames itself only fires for DNS queries that"
+    echo -e "hit this sing-box instance — devices that use external DoH/DoT (Chrome"
+    echo -e "auto-DoH, iOS Private Relay, Android Private DNS) will bypass it and"
+    echo -e "fail with i/o-timeout on GFW-poisoned or geo-restricted destinations."
+    echo
     echo -e "Health checks:"
-    echo -e "  ${yellow}systemctl status xray nftables tproxy-route${plain}"
-    echo -e "  ${yellow}journalctl -u xray -f${plain}"
-    echo -e "  ${yellow}nft list table inet xray${plain}                # TPROXY rules"
-    echo -e "  ${yellow}ip rule  | grep -i fwmark${plain}               # 'fwmark 0x1 lookup 100'"
-    echo -e "  ${yellow}ip route show table 100${plain}                 # 'local default dev lo'"
-    echo -e "  From a LAN device pointed at this gateway:"
-    echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP"
+    echo -e "  ${yellow}systemctl status sing-box${plain}"
+    echo -e "  ${yellow}journalctl -u sing-box -f${plain}"
+    echo -e "  ${yellow}ip link show singtun0${plain}                   # TUN device (auto_route)"
+    echo -e "  ${yellow}ip route show table all | grep singtun0${plain} # routes auto-installed by sing-box"
+    echo -e "  ${yellow}ls -lh /var/lib/sing-box${plain}                # cached rule_sets (cnsite/cnip/cngames)"
+    echo -e "  ${yellow}journalctl -u sing-box | grep proxy_udp${plain} # confirm UDP traffic uses hy2"
+    echo -e "  ${yellow}journalctl -u sing-box | grep proxy_tcp${plain} # confirm TCP traffic uses vless"
+    echo -e "  From a LAN device pointed at this gateway (gateway + DNS):"
+    echo -e "  ${yellow}curl https://ifconfig.me${plain}                # should return the SERVER's IP (TCP → vless)"
+    echo -e "  ${yellow}curl https://www.baidu.com -I${plain}           # should bypass proxy (CN-route)"
+    echo -e "  ${yellow}dig @<gateway-LAN-ip> www.google.com${plain}    # should answer in fakeip range (198.18/15)"
+    echo -e "  ${yellow}curl --http3-only https://cloudflare.com -I${plain}  # exercises QUIC/UDP via hy2 (curl ≥7.88)"
 fi
